@@ -19,11 +19,12 @@ cd D:\Projects\BrowserAuto
 ```powershell
 copy robots\oms\cel_307\credentials.env.example robots\oms\cel_307\credentials.env
 
-.\.venv\Scripts\python run_307.py --limit 3 --building "ГП №11"
+.\.venv\Scripts\python run_307.py --limit 3
 .\.venv\Scripts\python run_307.py --limit 1 --dry-run --keep-open 30
 
-# параллельно:
-.\robots\oms\cel_307\run_parallel.ps1 -Workers 5 -StartOffset 0
+# параллельно (6 воркеров, с начала файла):
+.\robots\oms\cel_307\run_parallel.ps1 -Workers 6 -StartOffset 0
 ```
 
+Логи воркеров: `robots/oms/cel_307/data/logs/w*.err.log`  
 Результат: `robots/oms/cel_307/data/oms_307_result_*.csv`.
