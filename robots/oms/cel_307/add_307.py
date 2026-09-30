@@ -649,13 +649,15 @@ def process_row(driver: WebDriver, row: Talon307, *, index: int, dry_run: bool) 
     try:
         open_ambulatory(driver)
         fill_patient_search(driver, row)
-        if (row.social_status or "").strip() and (row.occupation or "").strip():
-            logger.info("Соцстатус/занятость из Excel: {} / {}", row.social_status, row.occupation)
-        else:
-            ensure_social_status(driver, row)
+        # ambulatory: #socialStatus/#occupation нет → карта пациента (соцстатус + вид занятости)
+        ensure_social_status(driver, row)
 
         fill_referral(driver, row)
+        # не дёргать несуществующие поля на форме талона
+        soc_keep, occ_keep = row.social_status, row.occupation
+        row.social_status, row.occupation = "", ""
         fill_main(driver, row)
+        row.social_status, row.occupation = soc_keep, occ_keep
         fill_single_service(driver, row)
 
         if dry_run:
@@ -669,9 +671,12 @@ def process_row(driver: WebDriver, row: Talon307, *, index: int, dry_run: bool) 
         ok, msg = save_ambulatory(driver)
         logger.info("[{}] уведомление/итог Save: {}", index, msg)
         if (not ok) and dv._is_social_status_error(msg):
-            logger.warning("[{}] ошибка соцстатуса — повторяем", index)
+            logger.warning("[{}] ошибка соцстатуса — повторяем через карту пациента", index)
             ensure_social_status(driver, row)
+            soc_keep, occ_keep = row.social_status, row.occupation
+            row.social_status, row.occupation = "", ""
             fill_main(driver, row)
+            row.social_status, row.occupation = soc_keep, occ_keep
             fill_single_service(driver, row)
             ok, msg = save_ambulatory(driver)
             logger.info("[{}] уведомление/итог Save (повтор): {}", index, msg)
@@ -800,9 +805,16 @@ def _read_birth_anywhere(driver: WebDriver) -> str:
 
 
 def ensure_social_status(driver: WebDriver, row: Talon307) -> tuple[str, str]:
-    """Соцстатус/занятость: Excel → ДР на форме → 22/3 (логика возраста как в ДВ4)."""
-    soc = (row.social_status or "").strip()
-    occ = (row.occupation or "").strip()
+    """Соцстатус + вид занятости: Excel → ДР → карта пациента на ambulatory.
+
+    На /claim/ambulatory полей #socialStatus / #occupation нет — открываем карту
+    пациента, заполняем оба select и Save (как cel_3 / ДВ4).
+    """
+    excel_soc = (row.social_status or "").strip()
+    excel_occ = (row.occupation or "").strip()
+    soc, occ = excel_soc, excel_occ
+    if excel_soc and excel_occ:
+        logger.info("Соцстатус/занятость из Excel: {} / {}", excel_soc, excel_occ)
 
     birth_raw = _read_birth_anywhere(driver)
     if (not soc or not occ) and birth_raw:
@@ -822,13 +834,123 @@ def ensure_social_status(driver: WebDriver, row: Talon307) -> tuple[str, str]:
         soc, occ = "22", "3"
         logger.info("Соцстатус по умолчанию (как ДВ4 ≥60): {} / {}", soc, occ)
 
-    if driver.find_elements(By.ID, "socialStatus"):
+    # если поля уже на форме талона — заполняем здесь
+    on_claim = bool(driver.find_elements(By.ID, "socialStatus")) and bool(
+        driver.find_elements(By.ID, "occupation")
+    )
+    if on_claim:
         dv.try_input_enter_id(driver, "socialStatus", soc)
-    if driver.find_elements(By.ID, "occupation"):
         dv.try_input_enter_id(driver, "occupation", occ)
+        row.social_status, row.occupation = soc, occ
+        logger.info("Соцстатус на форме талона: {} / {}", soc, occ)
+        return soc, occ
+
+    logger.info("На форме талона нет #socialStatus/#occupation — открываем карту пациента")
+    dv.dismiss_overlays(driver)
+    if driver.find_elements(By.ID, "main-tab"):
+        dv.click_id(driver, "main-tab")
+        dv.wait_busy_gone(driver)
+        sleep(0.4)
+
+    btn = None
+    for xp in (
+        "//button[contains(.,'Редактировать')]",
+        dv.PATIENT_CARD_BTN_XPATH,
+        "//table//tbody/tr[5]/td//button",
+        "//table//tbody/tr[6]/td//button",
+        "//table//tbody/tr[.//button][last()]//button",
+        "//button[contains(.,'пациент') or contains(.,'Пациент')]",
+    ):
+        els = [e for e in driver.find_elements(By.XPATH, xp) if e.is_displayed()]
+        if els:
+            btn = els[0]
+            break
+    if btn is None:
+        logger.warning("Кнопка карты пациента не найдена — оставляем {} / {}", soc, occ)
+        row.social_status, row.occupation = soc, occ
+        return soc, occ
+
+    try:
+        btn.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", btn)
+    dv.wait_busy_gone(driver, timeout=30)
+    sleep(0.6)
+
+    try:
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "socialStatus")))
+    except Exception:
+        logger.warning("Карта пациента не открылась (#socialStatus) — {} / {}", soc, occ)
+        row.social_status, row.occupation = soc, occ
+        return soc, occ
+
+    # ДР в карте — только если Excel не задал оба поля
+    if (not excel_soc or not excel_occ) and driver.find_elements(By.ID, "birth-date"):
+        birth_card = driver.find_element(By.ID, "birth-date").get_attribute("value") or ""
+        year = dv._birth_year(birth_card)
+        if year is not None:
+            age = datetime.now().year - year
+            soc, occ = dv.social_occupation_by_age(age)
+            logger.info(
+                "Карта ДР={} → возраст≈{} → socialStatus={}, occupation={}",
+                birth_card,
+                age,
+                soc,
+                occ,
+            )
+
+    def _fill_select(element_id: str, value: str) -> None:
+        el = driver.find_element(By.ID, element_id)
+        dv.fill_react_select_input(driver, el, value)
+        sleep(0.25)
+        dv.wait_busy_gone(driver)
+        wrap = dv._closest_react_select(el)
+        shown = (wrap.text if wrap is not None else "") or ""
+        if str(value) not in shown:
+            el.send_keys(Keys.CONTROL, "a")
+            el.send_keys(Keys.BACKSPACE)
+            el.send_keys(str(value), Keys.ENTER)
+            sleep(0.5)
+            wrap = dv._closest_react_select(el)
+            shown = (wrap.text if wrap is not None else "") or ""
+        if str(value) not in shown:
+            raise RuntimeError(f"{element_id}: не выбрано «{value}», сейчас «{shown[:80]}»")
+        logger.info("{} → {}", element_id, shown.split("\n")[0][:80])
+
+    _fill_select("socialStatus", soc)
+    _fill_select("occupation", occ)
+
+    saves = [e for e in driver.find_elements(By.ID, "save-button") if e.is_displayed()]
+    if not saves:
+        raise RuntimeError("save-button карты пациента не найден")
+    try:
+        saves[0].click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", saves[0])
+    dv.wait_busy_gone(driver, timeout=60)
+    sleep(0.5)
+    dlg = dv.warning_dialog_text(driver)
+    if dlg or dv.find_visible_dialogs(driver):
+        ok, info = dv.handle_post_save_prompts(driver, timeout=20)
+        if not ok:
+            raise RuntimeError(f"Карта пациента не сохранена: {info}")
+        if info:
+            logger.info("После save карты: {}", info[:200])
+    else:
+        msg = dv.snackbar_text(driver) if hasattr(dv, "snackbar_text") else ""
+        if msg:
+            logger.info("После save карты: {}", msg[:200])
+        low = (msg or "").lower()
+        if any(x in low for x in ("ошибка", "обязательн", "не указан")):
+            raise RuntimeError(f"Карта пациента не сохранена: {msg}")
+
+    if driver.find_elements(By.ID, "main-tab"):
+        dv.click_id(driver, "main-tab")
+        dv.wait_busy_gone(driver)
+        sleep(0.3)
 
     row.social_status, row.occupation = soc, occ
-    logger.info("Соцстатус для талона: {} / {}", soc, occ)
+    logger.info("Соцстатус + вид занятости через карту пациента: {} / {}", soc, occ)
     return soc, occ
 
 
