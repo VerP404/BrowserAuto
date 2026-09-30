@@ -452,17 +452,24 @@ def warning_dialog_text(driver: WebDriver) -> str:
     return ""
 
 
+def _is_intersection_warning(text: str) -> bool:
+    """Пересечение с КС/СТАЦ/другим талоном — сохранять нельзя."""
+    low = (text or "").lower()
+    return "пересечен" in low  # пересечение / пересечения / пересечением
+
+
 def _is_blocking_dialog(text: str) -> bool:
-    """Жёсткий отказ. «Данные пациента изменены» / предупреждения — жмём кнопку, не fail."""
+    """Жёсткий отказ: дубликат, пересечение и т.п. — не жать «Сохранить с предупреждением»."""
     low = (text or "").lower()
     if "дубликат" in low:
+        return True
+    if _is_intersection_warning(low):
         return True
     if any(
         x in low
         for x in (
             "имеются предупрежд",
             "проверка врачей",
-            "пересечение",
             "данные пациента были изменены",
             "сохранить изменения",
             "для талона",
@@ -481,12 +488,12 @@ def _is_confirmable_warning(text: str) -> bool:
     low = (text or "").lower()
     if not low.strip():
         return False
-    if "дубликат" in low and "имеются предупрежд" not in low:
+    # пересечение / жёсткий дубликат — не подтверждаем
+    if _is_blocking_dialog(low):
         return False
     markers = (
         "предупрежд",
         "проверка врачей",
-        "пересечение",
         "рекоменд",
         "внимание",
         "имеются",
@@ -497,6 +504,92 @@ def _is_confirmable_warning(text: str) -> bool:
     return any(x in low for x in markers)
 
 
+def dismiss_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
+    """Закрыть диалог предупреждения без сохранения (НАЗАД / Отмена)."""
+    text = warning_dialog_text(driver)
+    prefer = (
+        "вернуться",
+        "назад",
+        "отмена",
+        "отменить",
+        "нет",
+        "закрыть",
+        "cancel",
+        "close",
+        "не сохр",
+    )
+    buttons: list[tuple[str, object]] = []
+    xpaths = (
+        "//button[contains(.,'НАЗАД') or contains(.,'Назад')]",
+        "//button[contains(.,'Отмена') or contains(.,'ОТМЕНА')]",
+        "//div[@role='dialog']//button",
+        "//div[contains(@class,'MuiDialog')]//button",
+        "//div[contains(@class,'MuiDialogActions')]//button",
+        "/html/body/div[3]//button",
+        "/html/body/div[4]//button",
+        "/html/body/div[5]//button",
+    )
+    seen = set()
+    for xp in xpaths:
+        for btn in driver.find_elements(By.XPATH, xp):
+            try:
+                if not btn.is_displayed():
+                    continue
+                key = btn.id
+                if key in seen:
+                    continue
+                seen.add(key)
+            except Exception:
+                continue
+            buttons.append((_btn_label(driver, btn), btn))
+
+    if not buttons:
+        # Escape как запасной вариант
+        try:
+            driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+            wait_busy_gone(driver, timeout=10)
+            sleep(0.3)
+            if not find_visible_dialogs(driver):
+                return True, text or "dismiss via Escape"
+        except Exception:
+            pass
+        return False, text or "нет кнопок для отмены диалога"
+
+    labels = [l or "(пусто)" for l, _ in buttons]
+    logger.info("Отмена диалога — кнопки ({}): {}", len(buttons), labels[:12])
+
+    chosen = None
+    chosen_label = ""
+    for want in prefer:
+        for label, btn in buttons:
+            low = label.lower().replace("\n", " ").strip()
+            if want in low:
+                chosen, chosen_label = btn, label
+                break
+        if chosen is not None:
+            break
+    if chosen is None:
+        # последняя кнопка часто «НАЗАД»
+        chosen_label, chosen = buttons[-1]
+
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'}); arguments[0].click();",
+            chosen,
+        )
+    except Exception:
+        try:
+            chosen.click()
+        except Exception as exc:
+            logger.warning("Не удалось нажать отмену диалога: {}", exc)
+            return False, text or str(exc)
+
+    logger.info("Нажали отмену диалога «{}»", (chosen_label or "").replace("\n", " ")[:80])
+    wait_busy_gone(driver, timeout=30)
+    sleep(0.4)
+    return True, text or f"отменено [{chosen_label}]"
+
+
 def confirm_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
     """Прочитать предупреждение и нажать Да (сохранить несмотря на предупреждение)."""
     text = warning_dialog_text(driver)
@@ -505,7 +598,11 @@ def confirm_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
     if not text:
         text = "(диалог без текста)"
     if _is_blocking_dialog(text):
-        logger.error("Блокирующее предупреждение: {}", text[:240])
+        # пересечение / дубликат — только отмена, без сохранения
+        logger.error("Блокирующее предупреждение (отмена Save): {}", text[:400])
+        dismissed, _ = dismiss_warning_dialog(driver)
+        if not dismissed:
+            logger.warning("Не удалось закрыть блокирующий диалог")
         return False, text
 
     logger.info("Предупреждение после сохранения:\n{}", text[:800])
@@ -663,8 +760,10 @@ def handle_post_save_prompts(driver: WebDriver, *, timeout: float = 40) -> tuple
 
         text = warning_dialog_text(driver)
         dialogs = find_visible_dialogs(driver)
-        if dialogs or (text and _is_confirmable_warning(text)):
+        if dialogs or (text and (_is_confirmable_warning(text) or _is_blocking_dialog(text))):
             if text and _is_blocking_dialog(text):
+                logger.error("Блокирующий диалог после Save — отмена: {}", text[:400])
+                dismiss_warning_dialog(driver)
                 return False, text
             ok, wtext = confirm_warning_dialog(driver)
             if not ok:

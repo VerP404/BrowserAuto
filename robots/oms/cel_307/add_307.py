@@ -525,6 +525,7 @@ def classify_snackbar(text: str) -> tuple[bool | None, str]:
         "ошибка",
         "онкология:",
         "дубликат",
+        "пересечен",
         "не найден",
         "не сохран",
         "отсутствует пациент",
@@ -610,8 +611,14 @@ def save_ambulatory(driver: WebDriver) -> tuple[bool, str]:
     if dlg or dv.find_visible_dialogs(driver):
         low = (dlg or "").lower()
         if "дубликат" in low:
+            dv.dismiss_warning_dialog(driver)
             return False, dlg or "Дубликат талона"
+        if dv._is_intersection_warning(dlg or ""):
+            logger.error("Пересечение — не сохраняем:\n{}", (dlg or "")[:500])
+            dv.dismiss_warning_dialog(driver)
+            return False, dlg or "Пересечение с другим талоном"
         if "результат поиска в црп" in low or "отсутствует пациент" in low:
+            dv.dismiss_warning_dialog(driver)
             return False, dlg
         # «Данные пациента были изменены» → ДЛЯ ТАЛОНА И ПАЦИЕНТА
         # (confirm_warning_dialog / handle_post_save_prompts)
