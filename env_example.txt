@@ -1,0 +1,15 @@
+# --- ОМС (robots/oms/*) ---
+OMS_BASE_URL=http://10.36.0.142:9000
+OMS_LOGIN=your_oms_login
+OMS_PASSWORD=your_oms_password
+
+# --- ИСЗЛ (robots/iszl/*) ---
+ISZL_BASE_URL=http://10.36.29.2:8088
+ISZL_LOGIN=your_iszl_login
+ISZL_PASSWORD=your_iszl_password
+
+# --- Браузер ---
+BROWSER_IMPLICIT_WAIT=10
+
+# --- Tesseract OCR (капча ИСЗЛ) ---
+TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe

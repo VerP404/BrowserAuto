@@ -1,0 +1,56 @@
+# BrowserAuto — git ignore
+
+# secrets & env
+.env
+credentials.env
+**/credentials.env
+
+# python / IDE
+.venv/
+**/__pycache__/
+*.pyc
+.idea/
+.vscode/
+*.egg-info/
+
+# browser driver (скачивается отдельно / лежит локально)
+geckodriver.exe
+geckodriver.log
+
+# local scratch (данные, логи, locked leftovers)
+_local/
+oms_307/
+oms_dv_opv/
+
+# legacy notebooks/prototypes — локально, не в публичный репо (возможны ПДн в выводах)
+archive/
+
+# runtime data & PII
+**/data/**
+!**/data/.gitkeep
+!**/data/captcha/.gitkeep
+data/captcha/*.png
+**/captcha/*.png
+!**/captcha/.gitkeep
+
+# spreadsheets / exports / archives
+*.xlsx
+*.xls
+*.csv
+*.zip
+*.rar
+~$*
+
+# logs & robot results
+**/logs/
+**/logs_*.txt
+**/oms_*_result_*.csv
+**/dv_opv_result_*.csv
+**/carryover_result_*.csv
+**/*_result_*.csv
+**/last_*.html
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store

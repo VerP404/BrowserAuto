@@ -1,0 +1,10 @@
+# Зависимости робота «Нет в текущем есть в прошлых»
+# Установка из корня BrowserAuto:
+#   .venv\Scripts\pip install -r "ИСЗЛ\Нет в текущем есть в прошлых\requirements.txt"
+
+selenium==4.15.2
+python-dotenv==1.0.0
+loguru==0.7.2
+openpyxl>=3.0.0
+pillow>=10.0.0
+pytesseract>=0.3.10
