@@ -6,7 +6,8 @@ URL:
   ДВ4 → /claim/medicalExamination/dv4
   ОПВ → /claim/medicalExamination/opv
 
-Страница 1: даты начала/окончания (по ним подбираются услуги), ЕНП, врач, результат, место=1, период, диагноз, ДН.
+Страница 1: даты начала/окончания (по ним подбираются услуги), ЕНП, врач, результат, период, диагноз, ДН.
+#medicalExaminationPlace не трогаем.
 Вкладка услуг: для каждой строки — врач из «справочник_врачей» (если код есть),
 иначе основной врач карты; «Выполнено», дата.
 
@@ -67,8 +68,8 @@ URL_BY_TYPE = {
     "дв4": "/claim/medicalExamination/dv4",
 }
 
-# Место обращения по умолчанию (как в ambulatory service-place=1)
-DEFAULT_PLACE = "1"
+# (legacy) колонка «место» в Excel читается, но #medicalExaminationPlace не заполняем
+DEFAULT_PLACE = ""
 DEFAULT_PERIOD = "январь"
 DEFAULT_DONE = "Да"  # combobox-failure-services-* («Выполнено») — только текст, не код
 
@@ -1604,20 +1605,8 @@ def fill_main_page(
         sleep(0.35)
         wait_busy_gone(driver)
 
-    place = row.place or DEFAULT_PLACE
-    # Место прохождения диспансеризации — без него вкладки Услуги/Назначения часто disabled
-    if not try_input_enter_id(driver, "medicalExaminationPlace", place):
-        # иногда это обычный input без react-select enter
-        els = driver.find_elements(By.ID, "medicalExaminationPlace")
-        if els:
-            try:
-                fill_react_select_input(driver, els[0], place)
-            except Exception:
-                logger.warning("medicalExaminationPlace не заполнен")
-        else:
-            logger.debug("medicalExaminationPlace не найден")
-    if not try_input_enter_id(driver, "service-place", place):
-        logger.debug("service-place не найден, место={}", place)
+    # #medicalExaminationPlace («Место прохождения диспансеризации») — НИКОГДА не заполняем.
+    # В Excel колонки под это поле нет; вмешательство ломает форму.
 
     period = row.period or DEFAULT_PERIOD
     if not try_input_enter_id(driver, "nextMonth", period):
