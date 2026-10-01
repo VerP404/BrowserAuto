@@ -6,7 +6,7 @@ URL:
   ДВ4 → /claim/medicalExamination/dv4
   ОПВ → /claim/medicalExamination/opv
 
-Страница 1: даты, ЕНП, врач, результат, место=1, период, диагноз, ДН.
+Страница 1: даты начала/окончания (по ним подбираются услуги), ЕНП, врач, результат, место=1, период, диагноз, ДН.
 Вкладка услуг: для каждой строки — врач из «справочник_врачей» (если код есть),
 иначе основной врач карты; «Выполнено», дата.
 
@@ -46,7 +46,15 @@ from browser_auto.config import OMS_BASE_URL, load_credentials
 from browser_auto.auth import login_oms
 from browser_auto.driver import GeckoBrowser
 
-from doctors_catalog import DoctorCatalog, resolve_service_doctor
+from doctors_catalog import (
+    DEFAULT_REFERENCE,
+    DoctorCatalog,
+    dn_search_texts,
+    load_dn_labels,
+    load_recredit_rules,
+    resolve_service_doctor,
+    resolve_service_done_and_date,
+)
 
 load_credentials(WORK_DIR / "credentials.env")
 
@@ -62,7 +70,28 @@ URL_BY_TYPE = {
 # Место обращения по умолчанию (как в ambulatory service-place=1)
 DEFAULT_PLACE = "1"
 DEFAULT_PERIOD = "январь"
-DEFAULT_DONE = "Да"  # combobox-failure-services-* («Выполнено»)
+DEFAULT_DONE = "Да"  # combobox-failure-services-* («Выполнено») — только текст, не код
+
+
+def normalize_service_done(value: object) -> str:
+    """Выполнено в ОМС: только «Да» или «Перезачет» (цифры/коды из Excel не годим)."""
+    text = str(value or "").strip()
+    if not text:
+        return DEFAULT_DONE
+    low = text.lower().replace("ё", "е")
+    if "перезач" in low:
+        return "Перезачет"
+    if low in ("да", "yes", "true", "1", "1.0", "+", "выполнено"):
+        return "Да"
+    if low in ("нет", "no", "0", "false"):
+        return "Да"  # для услуг ДВ4/ОПВ всегда отмечаем выполнение текстом
+    # любой другой мусор (код врача и т.п.) — не пускаем
+    if re.fullmatch(r"\d+([.,]\d+)?", text):
+        return DEFAULT_DONE
+    if text in ("Да", "Перезачет"):
+        return text
+    return DEFAULT_DONE
+
 # соцстатус/занятость по возрасту (см. ensure_patient_social_status)
 # 18<a<60 → 11/1; иначе (в т.ч. ≥60) → 22/3
 DEFAULT_SOCIAL_STATUS = "22"
@@ -137,26 +166,32 @@ def _cell(value: object) -> str:
 
 
 def normalize_oms_date(value: str) -> str:
-    """Дата для date-picker Web.ОМС: DD.MM.YYYY."""
-    text = (value or "").strip()
+    """Единый формат дат Web.ОМС: DD-MM-YY (маска гг)."""
+    return normalize_service_date(value)
+
+
+def normalize_service_date(value: object) -> str:
+    """Дата в ОМС: DD-MM-YY (гг, не гггг — иначе 2026 → 20)."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%d-%m-%y")
+    text = str(value).strip()
     if not text:
         return ""
     m = re.match(r"^(\d{1,2})[-./](\d{1,2})[-./](\d{2,4})$", text)
     if not m:
+        # уже цифры без разделителей DDMMYY / DDMMYYYY
+        digits = re.sub(r"\D", "", text)
+        if len(digits) == 6:
+            return f"{digits[0:2]}-{digits[2:4]}-{digits[4:6]}"
+        if len(digits) == 8:
+            return f"{digits[0:2]}-{digits[2:4]}-{digits[6:8]}"
         return text
     d, mo, y = m.groups()
-    if len(y) == 2:
-        y = f"20{y}"
-    return f"{int(d):02d}.{int(mo):02d}.{y}"
-
-
-def normalize_service_date(value: str) -> str:
-    """Дата услуги в ОМС: DD-MM-YY (маска гг, не гггг — иначе 2026 → 20)."""
-    dotted = normalize_oms_date(value)  # DD.MM.YYYY
-    if not dotted:
-        return ""
-    d, mo, y = dotted.split(".")
-    return f"{d}-{mo}-{y[-2:]}"
+    if len(y) == 4:
+        y = y[-2:]
+    return f"{int(d):02d}-{int(mo):02d}-{y}"
 
 
 def normalize_mkb(value: str) -> str:
@@ -183,10 +218,14 @@ def normalize_mkb(value: str) -> str:
 
 
 def _set_input_value(driver: WebDriver, el, text: str) -> None:
-    """Надёжная установка value (masked date-input часто глотает send_keys)."""
+    """Надёжная установка value (masked / not reachable by keyboard)."""
     driver.execute_script(
         """
         const el = arguments[0], val = arguments[1];
+        el.removeAttribute('readonly');
+        el.removeAttribute('disabled');
+        el.disabled = false;
+        el.readOnly = false;
         const setter = Object.getOwnPropertyDescriptor(
             window.HTMLInputElement.prototype, 'value'
         ).set;
@@ -196,7 +235,8 @@ def _set_input_value(driver: WebDriver, el, text: str) -> None:
         setter.call(el, val);
         el.dispatchEvent(new Event('input', {bubbles:true}));
         el.dispatchEvent(new Event('change', {bubbles:true}));
-        el.blur();
+        el.dispatchEvent(new KeyboardEvent('keydown', {key:'Tab', bubbles:true}));
+        el.dispatchEvent(new Event('blur', {bubbles:true}));
         """,
         el,
         text,
@@ -306,16 +346,21 @@ def collect_form_errors(driver: WebDriver) -> str:
         "[class*='error'][class*='HelperText']",
         ".field-error",
         ".error-message",
+        ".MuiAlert-message",
     ):
         for el in driver.find_elements(By.CSS_SELECTOR, sel):
             try:
                 if not el.is_displayed():
                     continue
                 t = (el.text or "").strip()
-                if t and t not in parts:
+                if t and t not in parts and t.upper() != "ОШИБКИ":
                     parts.append(t)
             except Exception:
                 continue
+    # панель ошибок талона (после клика claim-error)
+    panel = read_claim_error_panel(driver, click=False)
+    if panel and panel not in parts:
+        parts.append(panel)
     # aria-invalid поля
     try:
         bad = driver.execute_script(
@@ -334,6 +379,54 @@ def collect_form_errors(driver: WebDriver) -> str:
     except Exception:
         pass
     return " | ".join(parts)[:800]
+
+
+def read_claim_error_panel(driver: WebDriver, *, click: bool = True) -> str:
+    """Текст панели ошибок талона (#claim-error) — короткие пункты, не вся страница."""
+    try:
+        btns = driver.find_elements(By.ID, "claim-error")
+        if not btns:
+            return ""
+        btn = btns[0]
+        if click and btn.is_displayed():
+            try:
+                _click_el(driver, btn)
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn)
+            sleep(0.45)
+        text = driver.execute_script(
+            """
+            const pick = (root) => {
+              if (!root) return '';
+              const items = [...root.querySelectorAll('li, .MuiListItem-root, .MuiAlert-message, [class*=\"error\"]') ]
+                .map(el => (el.innerText||'').trim())
+                .filter(t => t && t.length > 3 && t.toUpperCase() !== 'ОШИБКИ'
+                       && !t.includes('СОХРАНИТЬ') && !t.includes('КАРТА'));
+              if (items.length) return [...new Set(items)].join(' | ').slice(0, 500);
+              return '';
+            };
+            // drawer / popover / dialog рядом
+            for (const sel of ['.MuiDrawer-root','.MuiPopover-root','.MuiModal-root','.MuiDialog-root','[role=\"presentation\"]']) {
+              for (const el of document.querySelectorAll(sel)) {
+                if (el.offsetParent === null && getComputedStyle(el).visibility === 'hidden') continue;
+                const t = pick(el);
+                if (t) return t;
+              }
+            }
+            const btn = document.getElementById('claim-error');
+            if (btn) {
+              let p = btn.parentElement;
+              for (let i = 0; i < 4 && p; i++, p = p.parentElement) {
+                const t = pick(p);
+                if (t) return t;
+              }
+            }
+            return '';
+            """
+        )
+        return (text or "").strip()
+    except Exception:
+        return ""
 
 
 def normalize_dn(value: str) -> str:
@@ -459,11 +552,18 @@ def _is_intersection_warning(text: str) -> bool:
 
 
 def _is_blocking_dialog(text: str) -> bool:
-    """Жёсткий отказ: дубликат, пересечение и т.п. — не жать «Сохранить с предупреждением»."""
-    low = (text or "").lower()
+    """Жёсткий отказ: дубликат, пересечение, недопустимое ДН — не жать подтверждение."""
+    low = (text or "").lower().replace("ё", "е")
     if "дубликат" in low:
         return True
     if _is_intersection_warning(low):
+        return True
+    # нельзя править ДН из диалога «для пациента» — только НАЗАД и правка на форме
+    if "недопустим" in low and ("диспансерн" in low or "наблюден" in low):
+        return True
+    if "диспансерн" in low and "диагноз" in low and any(
+        x in low for x in ("недопустим", "неверн", "нельзя", "исправить")
+    ):
         return True
     if any(
         x in low
@@ -505,19 +605,12 @@ def _is_confirmable_warning(text: str) -> bool:
 
 
 def dismiss_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
-    """Закрыть диалог предупреждения без сохранения (НАЗАД / Отмена)."""
+    """Закрыть диалог без сохранения (НАЗАД / Отмена).
+
+    Если есть «Сохранить с предупреждением» — НЕ гасим (нужно подтвердить).
+    """
     text = warning_dialog_text(driver)
-    prefer = (
-        "вернуться",
-        "назад",
-        "отмена",
-        "отменить",
-        "нет",
-        "закрыть",
-        "cancel",
-        "close",
-        "не сохр",
-    )
+    low_text = (text or "").lower().replace("ё", "е")
     buttons: list[tuple[str, object]] = []
     xpaths = (
         "//button[contains(.,'НАЗАД') or contains(.,'Назад')]",
@@ -543,8 +636,18 @@ def dismiss_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
                 continue
             buttons.append((_btn_label(driver, btn), btn))
 
+    btn_blob = " | ".join((l or "").lower().replace("\n", " ") for l, _ in buttons)
+    if (
+        "сохранить с предупреждением" in btn_blob
+        or "с предупреждением" in btn_blob
+        or "имеются предупрежд" in low_text
+    ):
+        logger.info(
+            "dismiss пропущен — диалог предупреждений (нужно «Сохранить с предупреждением»)"
+        )
+        return False, text or "нужно подтвердить предупреждение"
+
     if not buttons:
-        # Escape как запасной вариант
         try:
             driver.switch_to.active_element.send_keys(Keys.ESCAPE)
             wait_busy_gone(driver, timeout=10)
@@ -555,6 +658,17 @@ def dismiss_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
             pass
         return False, text or "нет кнопок для отмены диалога"
 
+    prefer = (
+        "назад",
+        "отмена",
+        "отменить",
+        "нет",
+        "закрыть",
+        "cancel",
+        "close",
+        "не сохр",
+        "вернуться",
+    )
     labels = [l or "(пусто)" for l, _ in buttons]
     logger.info("Отмена диалога — кнопки ({}): {}", len(buttons), labels[:12])
 
@@ -562,14 +676,13 @@ def dismiss_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
     chosen_label = ""
     for want in prefer:
         for label, btn in buttons:
-            low = label.lower().replace("\n", " ").strip()
+            low = (label or "").lower().replace("\n", " ").strip()
             if want in low:
                 chosen, chosen_label = btn, label
                 break
         if chosen is not None:
             break
     if chosen is None:
-        # последняя кнопка часто «НАЗАД»
         chosen_label, chosen = buttons[-1]
 
     try:
@@ -659,15 +772,17 @@ def confirm_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
     labels = [l or "(пусто)" for l, _ in buttons]
     logger.info("Кнопки диалога ({}): {}", len(buttons), labels[:12])
 
-    low_text = text.lower()
-    deny = ("назад", "отмена", "отменить", "нет", "закрыть", "cancel", "close", "не сохр")
+    low_text = text.lower().replace("ё", "е")
+    deny = ("назад", "отмена", "отменить", "нет", "закрыть", "cancel", "close", "не сохр", "вернуться")
 
-    # Приоритет кнопок (важнее всего — сохранить с предупреждением):
-    # 1) «Сохранить с предупреждением» при «Имеются предупреждения…»
-    # 2) «ДЛЯ ТАЛОНА И ПАЦИЕНТА» при «Данные пациента были изменены»
-    # 3) «Да»
     button_blob = " | ".join(l.lower().replace("\n", " ") for l, _ in buttons)
-    if "предупрежд" in button_blob or "сохранить с" in button_blob or "имеются предупрежд" in low_text:
+    # ВАЖНО: если есть «Сохранить с предупреждением» — всегда её (даже если текст ещё про пациента)
+    if (
+        "сохранить с предупреждением" in button_blob
+        or "с предупреждением" in button_blob
+        or "имеются предупрежд" in low_text
+        or "несоответств" in low_text
+    ):
         prefer = (
             "сохранить с предупреждением",
             "с предупреждением",
@@ -678,6 +793,7 @@ def confirm_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
         )
     elif "пациент" in low_text and ("изменены" in low_text or "сохранить изменения" in low_text):
         prefer = (
+            "для талона",
             "для талона и пациента",
             "талона и пациента",
             "и пациента",
@@ -702,6 +818,12 @@ def confirm_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
         for label, btn in buttons:
             low = label.lower().replace("\n", " ").strip()
             if any(d in low for d in deny):
+                continue
+            # «для талона» ≠ «для талона и пациента»
+            if want == "для талона":
+                if low == "для талона" or (low.startswith("для талона") and "пациент" not in low):
+                    chosen, chosen_label = btn, label
+                    break
                 continue
             if want == low or want in low:
                 chosen, chosen_label = btn, label
@@ -747,32 +869,172 @@ def confirm_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
 
 
 def handle_post_save_prompts(driver: WebDriver, *, timeout: float = 40) -> tuple[bool, str]:
-    """После Save: диалоги по очереди — пациент → предупреждения (Сохранить с предупреждением)."""
+    """После Save: диалоги по очереди — пациент → предупреждения (Сохранить с предупреждением).
+
+    Если всплыло недопустимое ДН (часто после «ДЛЯ ТАЛОНА И ПАЦИЕНТА») —
+    жмём НАЗАД и возвращаем ошибку, чтобы на форме поставить «Состоит» и Save снова.
+    """
     deadline = time() + timeout
     confirmed_texts: list[str] = []
     last_snack = ""
     snack_before = snackbar_text(driver)
     saved_with_warning = False
     patient_choice_done = False
+    patient_clicks = 0
+
+    def _dn_error_blob(dialog_text: str = "") -> str:
+        bits = [dialog_text or ""]
+        try:
+            panel = read_claim_error_panel(driver, click=True)
+            if panel:
+                bits.append(panel)
+        except Exception:
+            pass
+        try:
+            snack = snackbar_text(driver)
+            if snack:
+                bits.append(snack)
+        except Exception:
+            pass
+        return " | ".join(b for b in bits if b)
 
     while time() < deadline:
         wait_busy_gone(driver, timeout=15)
 
         text = warning_dialog_text(driver)
         dialogs = find_visible_dialogs(driver)
+
+        # до/во время диалога — недопустимое ДН → НАЗАД, правим на форме
+        # НО не путать с «Имеются предупреждения» по услугам
+        try:
+            btn_blob0 = " | ".join(
+                (_btn_label(driver, b) or "").lower().replace("\n", " ")
+                for b in driver.find_elements(By.XPATH, "//button")
+                if b.is_displayed()
+            )
+        except Exception:
+            btn_blob0 = ""
+        low0 = (text or "").lower().replace("ё", "е")
+        service_warn0 = (
+            "имеются предупрежд" in low0
+            or "несоответств" in low0
+            or "специальност" in low0
+            or "сохранить с предупреждением" in btn_blob0
+        )
+        blob = _dn_error_blob(text)
+        if (
+            not service_warn0
+            and (_is_invalid_dn_error(blob) or _is_invalid_dn_error(text or ""))
+        ):
+            logger.warning(
+                "Недопустимое ДН в диалоге/ошибках — НАЗАД, чтобы исправить на форме: {}",
+                blob[:300],
+            )
+            dismiss_warning_dialog(driver)
+            sleep(0.3)
+            t_after = (warning_dialog_text(driver) or "").lower().replace("ё", "е")
+            if "имеются предупрежд" in t_after or "несоответств" in t_after:
+                logger.info("После НАЗАД по ДН — предупреждения по услугам, подтвердим")
+            elif find_visible_dialogs(driver) or warning_dialog_text(driver):
+                dismiss_warning_dialog(driver)
+                return False, blob[:500]
+            else:
+                return False, blob[:500]
+
         if dialogs or (text and (_is_confirmable_warning(text) or _is_blocking_dialog(text))):
             if text and _is_blocking_dialog(text):
-                logger.error("Блокирующий диалог после Save — отмена: {}", text[:400])
-                dismiss_warning_dialog(driver)
-                return False, text
+                # не считать блокирующим, если уже есть «Сохранить с предупреждением»
+                try:
+                    bb0 = " | ".join(
+                        (_btn_label(driver, b) or "").lower().replace("\n", " ")
+                        for b in driver.find_elements(By.XPATH, "//button")
+                        if b.is_displayed()
+                    )
+                except Exception:
+                    bb0 = ""
+                if "сохранить с предупреждением" in bb0 or "с предупреждением" in bb0:
+                    logger.info("Есть «Сохранить с предупреждением» — подтверждаем, не НАЗАД")
+                else:
+                    logger.error("Блокирующий диалог после Save — отмена (НАЗАД): {}", text[:400])
+                    dismiss_warning_dialog(driver)
+                    return False, text
+
+            # Порядок как сказал пользователь:
+            # 1) «ДЛЯ ТАЛОНА» (диалог пациента)
+            # 2) в следующем окне «Сохранить с предупреждением»
+            # Между ними НЕ жмём НАЗАД.
             ok, wtext = confirm_warning_dialog(driver)
             if not ok:
                 return False, wtext or text or "Диалог не подтверждён"
-            low_w = (wtext or "").lower()
-            if "сохранить с предупреждением" in low_w or "→ [сохранить с" in low_w:
+            low_w = (wtext or "").lower().replace("ё", "е")
+            clicked = ""
+            if "→ [" in low_w:
+                clicked = low_w.rsplit("→ [", 1)[-1].rstrip("]").strip()
+            if "сохранить с предупреждением" in clicked or "с предупреждением" in clicked:
                 saved_with_warning = True
-            if "для талона и пациента" in low_w or "→ [для талона и пациента" in low_w:
                 patient_choice_done = True
+            # После «ДЛЯ ТАЛОНА» (не «и пациента») ждём следующее окно и жмём
+            # «Сохранить с предупреждением». Между ними НЕ жмём НАЗАД.
+            if clicked.startswith("для талона"):
+                patient_choice_done = True
+                patient_clicks += 1
+                logger.info(
+                    "Нажали «{}» — ждём окно «Имеются предупреждения» / «Сохранить с предупреждением»…",
+                    clicked[:60],
+                )
+                wait_until = time() + 10.0
+                while time() < wait_until:
+                    try:
+                        bb = " | ".join(
+                            (_btn_label(driver, b) or "").lower().replace("\n", " ")
+                            for b in driver.find_elements(By.XPATH, "//button")
+                            if b.is_displayed()
+                        )
+                    except Exception:
+                        bb = ""
+                    t_w = (warning_dialog_text(driver) or "").lower().replace("ё", "е")
+                    if (
+                        "сохранить с предупреждением" in bb
+                        or "с предупреждением" in bb
+                        or "имеются предупрежд" in t_w
+                        or "несоответств" in t_w
+                    ):
+                        logger.info("Появилось окно предупреждений — жмём «Сохранить с предупреждением»")
+                        break
+                    if not find_visible_dialogs(driver) and not (warning_dialog_text(driver) or "").strip():
+                        logger.info("После «ДЛЯ ТАЛОНА» диалогов нет")
+                        break
+                    # реальная ошибка ДН (не предупреждения по услугам) → НАЗАД
+                    try:
+                        panel = read_claim_error_panel(driver, click=True)
+                    except Exception:
+                        panel = ""
+                    if (
+                        panel
+                        and _is_invalid_dn_error(panel)
+                        and "несоответств" not in panel.lower()
+                        and "имеются предупрежд" not in panel.lower()
+                    ):
+                        logger.warning("После «ДЛЯ ТАЛОНА» ошибка ДН — НАЗАД: {}", panel[:200])
+                        dismiss_warning_dialog(driver)
+                        return False, panel[:500]
+                    sleep(0.3)
+                try:
+                    bb2 = " | ".join(
+                        (_btn_label(driver, b) or "").lower().replace("\n", " ")
+                        for b in driver.find_elements(By.XPATH, "//button")
+                        if b.is_displayed()
+                    )
+                except Exception:
+                    bb2 = ""
+                if "сохранить с предупреждением" in bb2 or "с предупреждением" in bb2:
+                    ok2, w2 = confirm_warning_dialog(driver)
+                    if ok2:
+                        saved_with_warning = True
+                        if w2:
+                            confirmed_texts.append(w2[:240])
+                        sleep(0.4)
+                        continue
             if wtext:
                 confirmed_texts.append(wtext[:240])
             sleep(0.4)
@@ -784,6 +1046,8 @@ def handle_post_save_prompts(driver: WebDriver, *, timeout: float = 40) -> tuple
             last_snack = msg
             if "дубликат" in msg.lower():
                 return False, msg
+            if _is_invalid_dn_error(msg):
+                return False, msg
             if _is_save_fail_message(msg) and not saved_with_warning and not confirmed_texts:
                 wait_dlg_until = time() + 3
                 while time() < wait_dlg_until:
@@ -791,7 +1055,9 @@ def handle_post_save_prompts(driver: WebDriver, *, timeout: float = 40) -> tuple
                         break
                     sleep(0.25)
                 else:
-                    return False, msg
+                    # claim-error может держать текст про ДН
+                    blob4 = _dn_error_blob(msg)
+                    return False, blob4[:500] or msg
                 continue
             if _is_save_ok_message(msg) or confirmed_texts:
                 summary = " | ".join(confirmed_texts)
@@ -814,7 +1080,10 @@ def handle_post_save_prompts(driver: WebDriver, *, timeout: float = 40) -> tuple
     # таймаут: если диалог предупреждений ещё висит — FAIL (нельзя считать OK)
     still = warning_dialog_text(driver)
     if find_visible_dialogs(driver) or _is_confirmable_warning(still):
-        return False, (still or "Диалог остался открытым после Save")[:400]
+        blob5 = _dn_error_blob(still or "")
+        if _is_invalid_dn_error(blob5) or find_visible_dialogs(driver):
+            dismiss_warning_dialog(driver)
+        return False, (blob5 or still or "Диалог остался открытым после Save")[:400]
     if confirmed_texts:
         return True, " | ".join(confirmed_texts)
     if last_snack:
@@ -826,60 +1095,153 @@ def handle_post_save_prompts(driver: WebDriver, *, timeout: float = 40) -> tuple
     return False, "После Save нет snackbar/диалога — талон скорее всего не сохранён"
 
 
-def click_claim_save(driver: WebDriver) -> str:
-    """Нажать Сохранить у талона. Сначала main-tab, приоритет #save-button."""
-    dismiss_overlays(driver)
-    # На вкладке услуг кнопка сохранения талона может быть недоступна / другой id-save
-    if driver.find_elements(By.ID, "main-tab"):
+def _date_field_empty(driver: WebDriver, element_id: str) -> bool:
+    """True только если поля нет или value пустой. Уже введённую дату НЕ считаем битой."""
+    els = driver.find_elements(By.ID, element_id)
+    if not els:
+        return True
+    actual = (els[0].get_attribute("value") or "").strip()
+    # маски вида __-__-__ / .. считаем пустыми
+    digits = re.sub(r"\D", "", actual)
+    return not digits
+
+
+def ensure_claim_dates_present(driver: WebDriver, begin: str, end: str, *, why: str = "") -> bool:
+    """Если begin/end пустые — ввести. Если уже есть — НЕ трогать. True если что-то вводили."""
+    need_begin = bool((begin or "").strip()) and _date_field_empty(driver, "begin-date")
+    need_end = bool((end or "").strip()) and _date_field_empty(driver, "end-date")
+    if not need_begin and not need_end:
         try:
-            click_id(driver, "main-tab")
-            wait_busy_gone(driver, timeout=20)
-            sleep(0.35)
-        except Exception as exc:
-            logger.debug("main-tab перед Save: {}", exc)
+            bv = (driver.find_element(By.ID, "begin-date").get_attribute("value") or "").strip()
+            ev = (driver.find_element(By.ID, "end-date").get_attribute("value") or "").strip()
+        except Exception:
+            bv = ev = "?"
+        logger.info("Даты на месте ({}), не трогаем begin={!r} end={!r}", why or "check", bv, ev)
+        return False
+    logger.warning(
+        "Даты пустые ({}) begin_empty={} end_empty={} — вводим только пустые",
+        why or "check",
+        need_begin,
+        need_end,
+    )
+    if need_begin:
+        fill_date_field(driver, "begin-date", begin)
+    if need_end:
+        fill_date_field(driver, "end-date", end)
+    return True
 
-    candidates: list[tuple[str, object]] = []
 
-    for el in driver.find_elements(By.ID, "save-button"):
-        if _visible_enabled(el):
-            candidates.append(("save-button", el))
-    for el in driver.find_elements(By.ID, "id-save"):
-        if _visible_enabled(el):
-            candidates.append(("id-save", el))
-    for el in driver.find_elements(
-        By.XPATH,
-        "//button[contains(.,'Сохранить') or contains(.,'СОХРАНИТЬ')]",
-    ):
-        if _visible_enabled(el):
-            label = _btn_label(driver, el).lower()
-            if any(x in label for x in ("пациент", "карт", "соц")):
+def ensure_claim_dates(driver: WebDriver, begin: str, end: str) -> bool:
+    """Совместимость: только дозаполнение пустых."""
+    return ensure_claim_dates_present(driver, begin, end, why="ensure_claim_dates")
+
+
+def ensure_service_dates(driver: WebDriver, date_text: str) -> int:
+    """Заполнить date-picker-services-* только там, где дата пустая. Уже заполненные не трогать."""
+    if not (date_text or "").strip():
+        return 0
+    open_services_tab(driver)
+    indices = list_service_indices(driver)
+    if not indices:
+        logger.warning("Нет строк услуг для проверки дат")
+        return 0
+    filled = 0
+    skipped = 0
+    for i in indices:
+        try:
+            els = driver.find_elements(By.ID, f"date-picker-services-{i}")
+            if not els:
                 continue
-            candidates.append(("text-Сохранить", el))
+            actual = (els[0].get_attribute("value") or "").strip()
+            if re.sub(r"\D", "", actual):
+                skipped += 1
+                continue
+            try:
+                fill_service_done(driver, i, "Да")
+            except Exception:
+                pass
+            fill_service_date(driver, i, date_text)
+            filled += 1
+        except Exception as exc:
+            logger.warning("Услуга[{}] ensure даты: {}", i, exc)
+    logger.info(
+        "Даты услуг: дозаполнено={}, уже были={}, эталон={}",
+        filled,
+        skipped,
+        normalize_service_date(date_text),
+    )
+    return filled
+
+
+# совместимость со старым именем
+def refill_service_dates(driver: WebDriver, date_text: str) -> int:
+    return ensure_service_dates(driver, date_text)
+
+
+def click_claim_save(
+    driver: WebDriver,
+    *,
+    begin: str = "",
+    end: str = "",
+) -> str:
+    """Нажать Сохранить талона на текущей вкладке (услуги/назначения). На main-tab НЕ уходим."""
+    dismiss_overlays(driver)
+    # Даты НЕ трогаем. На карту (main-tab) НЕ переключаемся — Save есть на услугах.
+    _ = (begin, end)
+
+    def _collect_save_btns() -> list[tuple[str, object]]:
+        found: list[tuple[str, object]] = []
+        # id-save — кнопка сохранения талона (в т.ч. на вкладке Услуги)
+        for el in driver.find_elements(By.ID, "id-save"):
+            if _visible_enabled(el):
+                found.append(("id-save", el))
+        for el in driver.find_elements(By.ID, "save-button"):
+            if _visible_enabled(el):
+                # save-button на карте пациента — пропускаем по подписи
+                label = _btn_label(driver, el).lower()
+                if any(x in label for x in ("пациент", "карт", "соц")):
+                    continue
+                found.append(("save-button", el))
+        for el in driver.find_elements(
+            By.XPATH,
+            "//button[contains(.,'Сохранить') or contains(.,'СОХРАНИТЬ')]",
+        ):
+            if _visible_enabled(el):
+                label = _btn_label(driver, el).lower()
+                if any(x in label for x in ("пациент", "карт", "соц")):
+                    continue
+                found.append(("text-Сохранить", el))
+        return found
+
+    candidates = _collect_save_btns()
+    if not candidates:
+        # если были на назначениях и кнопки нет — вернуться на Услуги (не на карту)
+        if driver.find_elements(By.ID, "services-tab"):
+            try:
+                click_id(driver, "services-tab")
+                wait_busy_gone(driver, timeout=15)
+                sleep(0.25)
+            except Exception as exc:
+                logger.debug("services-tab перед Save: {}", exc)
+        candidates = _collect_save_btns()
 
     if not candidates:
-        # подождать появления save-button
         try:
             _wait(driver, 8).until(
-                lambda d: any(_visible_enabled(e) for e in d.find_elements(By.ID, "save-button"))
-                or any(_visible_enabled(e) for e in d.find_elements(By.ID, "id-save"))
+                lambda d: any(_visible_enabled(e) for e in d.find_elements(By.ID, "id-save"))
+                or any(_visible_enabled(e) for e in d.find_elements(By.ID, "save-button"))
             )
         except TimeoutException:
             pass
-        for el in driver.find_elements(By.ID, "save-button"):
-            if _visible_enabled(el):
-                candidates.append(("save-button", el))
-        for el in driver.find_elements(By.ID, "id-save"):
-            if _visible_enabled(el):
-                candidates.append(("id-save", el))
+        candidates = _collect_save_btns()
 
     if candidates:
         how, el = candidates[0]
-        logger.info("Сохранение талона: клик {} (вариантов {})", how, len(candidates))
+        logger.info("Сохранение талона: клик {} (вариантов {}), без перехода на main-tab", how, len(candidates))
         _click_el(driver, el)
         return how
 
     errs = collect_form_errors(driver)
-    # F2 — горячая клавиша сохранения в Web.ОМС
     logger.info("Сохранение талона: F2 (кнопка не найдена). errors={}", errs)
     try:
         body = driver.find_element(By.TAG_NAME, "body")
@@ -889,7 +1251,12 @@ def click_claim_save(driver: WebDriver) -> str:
         raise RuntimeError(f"Кнопка сохранения не найдена и F2 не сработал: {exc}; errors={errs!r}") from exc
 
 
-def save_claim(driver: WebDriver) -> tuple[bool, str]:
+def save_claim(
+    driver: WebDriver,
+    *,
+    begin: str = "",
+    end: str = "",
+) -> tuple[bool, str]:
     """Сохранить талон: Save → прочитать предупреждение → нажать Да (как в талоны2)."""
     enp_before = ""
     try:
@@ -902,7 +1269,7 @@ def save_claim(driver: WebDriver) -> tuple[bool, str]:
         logger.warning("Перед Save ошибки формы: {}", pre_errs)
 
     try:
-        click_claim_save(driver)
+        click_claim_save(driver, begin=begin, end=end)
     except RuntimeError as exc:
         return False, str(exc)
 
@@ -924,6 +1291,9 @@ def save_claim(driver: WebDriver) -> tuple[bool, str]:
         pass
 
     post_errs = collect_form_errors(driver)
+    panel = read_claim_error_panel(driver, click=True)
+    if panel and panel not in (post_errs or ""):
+        post_errs = f"{post_errs} | {panel}".strip(" |") if post_errs else panel
     snack = snackbar_text(driver)
     dlg = warning_dialog_text(driver)
     extra_bits = [b for b in (msg, snack, dlg, post_errs) if b]
@@ -1025,9 +1395,9 @@ def load_talons(path: Path) -> list[TalonRow]:
         if len(re.sub(r"\D", "", enp)) < 11:
             continue
         extras: list[tuple[str, str]] = []
-        for idx in range(2, 8):
-            i_dx_n = col(f"диагноз{idx}", f"diagnosis{idx}", f"ds{idx}")
-            i_dn_n = col(f"дн{idx}", f"dn{idx}", f"is_dn{idx}")
+        for n_extra in range(2, 8):
+            i_dx_n = col(f"диагноз{n_extra}", f"diagnosis{n_extra}", f"ds{n_extra}")
+            i_dn_n = col(f"дн{n_extra}", f"dn{n_extra}", f"is_dn{n_extra}")
             if i_dx_n is None:
                 continue
             dx_n = normalize_mkb(_cell(raw[i_dx_n]))
@@ -1038,8 +1408,8 @@ def load_talons(path: Path) -> list[TalonRow]:
         out.append(
             TalonRow(
                 enp=enp,
-                begin=_cell(raw[i_beg]),
-                end=_cell(raw[i_end]),
+                begin=normalize_service_date(_cell(raw[i_beg])),
+                end=normalize_service_date(_cell(raw[i_end])),
                 exam_type=_norm_type(_cell(raw[i_type])),
                 doctor=_cell(raw[i_doc]) if i_doc is not None else "",
                 result=_cell(raw[i_res]) if i_res is not None else "",
@@ -1048,7 +1418,7 @@ def load_talons(path: Path) -> list[TalonRow]:
                 dn=normalize_dn(_cell(raw[i_dn])) if i_dn is not None else "",
                 building=_cell(raw[i_bldg]) if i_bldg is not None else "",
                 place=_cell(raw[i_place]) if i_place is not None else DEFAULT_PLACE,
-                done_value=_cell(raw[i_done]) if i_done is not None else DEFAULT_DONE,
+                done_value=normalize_service_done(_cell(raw[i_done]) if i_done is not None else DEFAULT_DONE),
                 purpose_type=_cell(raw[i_purp]) if i_purp is not None else "",
                 purpose_from=_cell(raw[i_from]) if i_from is not None else "",
                 purpose_to=_cell(raw[i_to]) if i_to is not None else "",
@@ -1138,8 +1508,20 @@ def fill_date_field(driver: WebDriver, element_id: str, raw: str) -> None:
 
 
 def fill_patient_and_search(driver: WebDriver, row: TalonRow) -> None:
+    """Даты начала/окончания → ЕНП → поиск. По датам ОМС подбирает услуги."""
     dismiss_overlays(driver)
-    # даты карты — один раз в конце fill_main_page (поиск/врач их сбрасывают)
+    fill_date_field(driver, "begin-date", row.begin)
+    fill_date_field(driver, "end-date", row.end)
+    # один раз проверяем, что даты реально в полях (если пусто — добить сейчас, не на Save)
+    for eid, raw in (("begin-date", row.begin), ("end-date", row.end)):
+        if not (raw or "").strip():
+            continue
+        if _date_field_empty(driver, eid):
+            logger.warning("{} пусто после первого ввода — повторяем СЕЙЧАС (не на Save)", eid)
+            fill_date_field(driver, eid, raw)
+        else:
+            val = (driver.find_element(By.ID, eid).get_attribute("value") or "").strip()
+            logger.info("{} на месте: {!r} — дальше не трогаем", eid, val)
     click_id(driver, "enp")
     input_id(driver, "enp", row.enp)
     # кнопка поиска рядом с ЕНП (как в ambulatory)
@@ -1196,7 +1578,11 @@ def fill_patient_and_search(driver: WebDriver, row: TalonRow) -> None:
         ) from exc
 
 
-def fill_main_page(driver: WebDriver, row: TalonRow) -> None:
+def fill_main_page(
+    driver: WebDriver,
+    row: TalonRow,
+    dn_labels: dict[str, str] | None = None,
+) -> None:
     """Первая вкладка medicalExamination."""
     if (row.doctor or "").strip():
         input_enter_id(driver, "doctor", row.doctor)
@@ -1237,27 +1623,35 @@ def fill_main_page(driver: WebDriver, row: TalonRow) -> None:
     if not try_input_enter_id(driver, "nextMonth", period):
         logger.warning("Поле nextMonth не найдено")
 
-    # Диагнозы + ДН: основной (0) и сопутствующие (1…)
+    # Диагнозы + ДН: основной (0). Сопутствующие — только если строки уже есть в форме
+    # (кнопку #add-diagnosis не жмём — лишние строки не создаём).
+    dn_map = dn_labels if dn_labels is not None else load_dn_labels()
     dx_pairs: list[tuple[str, str]] = []
     if row.diagnosis:
-        dx_pairs.append((row.diagnosis, row.dn or ""))
+        dx_pairs.append((row.diagnosis, dn_for_exam_type(row.exam_type, row.dn or "")))
     for dx, dn in row.extra_diagnoses:
         if dx:
-            dx_pairs.append((dx, dn or ""))
+            dx_pairs.append((dx, dn_for_exam_type(row.exam_type, dn or "")))
     for i, (dx, dn) in enumerate(dx_pairs):
+        if i > 0 and not driver.find_elements(By.ID, f"diagnosis-{i}"):
+            logger.info(
+                "Пропуск сопутствующего диагноза[{}] {} — строки нет (add-diagnosis не используем)",
+                i,
+                dx,
+            )
+            continue
         try_input_enter_id(driver, f"diagnosis-{i}", dx)
         sleep(0.2)
         if dn:
-            if not try_input_enter_id(driver, f"is-dispensary-observation-{i}", dn):
-                if i == 0:
-                    _try_fill_dn_fallback(driver, dn)
-                else:
-                    logger.warning("ДН[{}] не заполнен ({})", i, dn)
+            if not fill_dn_field(driver, i, dn, dn_map):
+                logger.warning("ДН[{}] не заполнен ({})", i, dn)
             sleep(0.15)
 
-    # один раз в конце карты — поиск/врач/место сбрасывают begin
-    fill_date_field(driver, "begin-date", row.begin)
-    fill_date_field(driver, "end-date", row.end)
+
+def ensure_diagnosis_slot(driver: WebDriver, index: int) -> None:
+    """Устарело: строки диагнозов через #add-diagnosis не создаём."""
+    return
+
 
 
 def _birth_year(value: str) -> int | None:
@@ -1295,22 +1689,49 @@ def _read_birth_from_main_tab(driver: WebDriver) -> str:
 
 def ensure_patient_social_status(driver: WebDriver, row: TalonRow | None = None) -> tuple[str, str]:
     """
-    main-tab → кнопка карты пациента → socialStatus / occupation по году рождения.
+    Кнопка карты пациента → socialStatus / occupation по году рождения.
     Сохранение пациента: #save-button.
+    НЕ кликаем main-tab «на всякий случай» — это сбрасывает begin/end даты лечения.
     """
     if row and (row.social_status or "").strip() and (row.occupation or "").strip():
         soc, occ = row.social_status.strip(), row.occupation.strip()
-        logger.info("Соцстатус/занятость из Excel: {} / {}", soc, occ)
+        logger.info("Соцстатус/занятость из Excel: {} / {} — всё равно пишем в карту пациента", soc, occ)
     else:
         soc = occ = ""
 
     dismiss_overlays(driver)
-    if driver.find_elements(By.ID, "main-tab"):
+    # main-tab только если кнопки пациента ещё не видно (без лишнего remount формы)
+    birth_raw = _read_birth_from_main_tab(driver)
+    patient_btns = [
+        e
+        for e in driver.find_elements(By.XPATH, PATIENT_CARD_BTN_XPATH)
+        if e.is_displayed()
+    ]
+    if not patient_btns and driver.find_elements(By.ID, "main-tab"):
+        logger.info("Кнопки пациента нет на экране — один клик main-tab")
         click_id(driver, "main-tab")
         wait_busy_gone(driver)
         sleep(0.4)
+        birth_raw = birth_raw or _read_birth_from_main_tab(driver)
+        try:
+            _wait(driver, 8).until(
+                lambda d: any(
+                    e.is_displayed()
+                    for e in d.find_elements(By.XPATH, PATIENT_CARD_BTN_XPATH)
+                )
+                or any(
+                    e.is_displayed()
+                    for e in d.find_elements(By.XPATH, "//button[contains(.,'Редактировать')]")
+                )
+                or any(
+                    e.is_displayed()
+                    for e in d.find_elements(By.XPATH, "//table//tbody//button")
+                )
+            )
+        except TimeoutException:
+            pass
+        sleep(0.3)
 
-    birth_raw = _read_birth_from_main_tab(driver)
     if (not soc or not occ) and birth_raw:
         year = _birth_year(birth_raw)
         if year is not None:
@@ -1332,6 +1753,7 @@ def ensure_patient_social_status(driver: WebDriver, row: TalonRow | None = None)
         "//table//tbody/tr[5]/td//button",
         "//table//tbody/tr[6]/td//button",
         "//table//tbody/tr[.//button][last()]//button",
+        "//table//tbody//button",
         "//button[contains(.,'пациент') or contains(.,'Пациент')]",
     ):
         els = [e for e in driver.find_elements(By.XPATH, xp) if e.is_displayed()]
@@ -1339,6 +1761,16 @@ def ensure_patient_social_status(driver: WebDriver, row: TalonRow | None = None)
             btn = els[0]
             break
     if btn is None:
+        # если ДР уже дала соцстатус — заполним на карте талона без окна пациента
+        if soc and occ and row is not None:
+            row.social_status = soc
+            row.occupation = occ
+            logger.warning(
+                "Кнопка карты пациента не найдена — ставим social/occupation на форме талона ({}/{})",
+                soc,
+                occ,
+            )
+            return soc, occ
         raise RuntimeError("Кнопка карты пациента на main-tab не найдена")
 
     try:
@@ -1425,11 +1857,8 @@ def ensure_patient_social_status(driver: WebDriver, row: TalonRow | None = None)
     if "medicalExamination" not in url:
         raise RuntimeError(f"После save карты ушли со страницы талона: {url}")
 
-    # вернуться к полям карты талона
-    if driver.find_elements(By.ID, "main-tab"):
-        click_id(driver, "main-tab")
-        wait_busy_gone(driver)
-        sleep(0.3)
+    # НЕ жмём main-tab после save — remount сбрасывает begin/end.
+    # Остаёмся на форме талона как есть после закрытия карты пациента.
 
     if row is not None:
         row.social_status = soc
@@ -1446,28 +1875,198 @@ def _is_social_status_error(msg: str) -> bool:
             "соцстатус",
             "занятост",
             "вид занятости",
+            "не указан социальн",
+            "отсутствует вид занятости",
         )
     )
 
 
-def _try_fill_dn_fallback(driver: WebDriver, dn: str) -> None:
-    """ДН рядом с диагнозом: input в блоке «Диспансерное наблюдение»."""
-    xpaths = (
-        "//div[contains(.,'Диспансерное наблюдение')]"
-        "//input[contains(@id,'react-select') or @type='text']",
-        "//label[contains(.,'Диспансерное')]/following::input[1]",
+def _is_invalid_dn_error(msg: str) -> bool:
+    """«Недопустимое значение диспансерного наблюдения при диагнозе …» → ставим Состоит."""
+    low = (msg or "").lower().replace("ё", "е")
+    if not low:
+        return False
+    if "недопустим" in low and ("диспансерн" in low or "наблюден" in low):
+        return True
+    if "значен" in low and "диспансерн" in low:
+        return True
+    if "диспансерн" in low and "диагноз" in low and any(
+        x in low for x in ("недопустим", "неверн", "ошибк", "не соответ", "правим дн")
+    ):
+        return True
+    # диалог пациента завис / НАЗАД — тоже чиним ДН на «Состоит»
+    if "правим дн на форме" in low or "диалог пациента" in low and "назад" in low:
+        return True
+    return False
+
+
+def _needs_dn_consists_fix(msg: str) -> bool:
+    """После Save нужно НАЗАД→Состоит→Save: явная ошибка ДН или зависший диалог пациента."""
+    if _is_invalid_dn_error(msg):
+        return True
+    low = (msg or "").lower().replace("ё", "е")
+    if "данные пациента были изменены" in low and any(
+        x in low for x in ("error", "ошибк", "назад", "не закрыл", "claim-error")
+    ):
+        return True
+    return False
+
+
+def apply_dn_code(
+    driver: WebDriver,
+    row: TalonRow,
+    dn_code: str,
+    dn_labels: dict[str, str] | None,
+    *,
+    why: str = "",
+) -> None:
+    """Выставить ДН=dn_code на основной (+ сопутствующие с тем же кодом, если были 1/3/пусто)."""
+    code = normalize_dn(dn_code) or str(dn_code).strip()
+    row.dn = code
+    new_extras: list[tuple[str, str]] = []
+    for dx, dn in row.extra_diagnoses:
+        prev = normalize_dn(dn) or (dn or "").strip()
+        if dx and prev in ("", "1", "3", "7"):
+            new_extras.append((dx, code))
+        else:
+            new_extras.append((dx, dn))
+    row.extra_diagnoses = new_extras
+    if not driver.find_elements(By.ID, "is-dispensary-observation-0"):
+        if driver.find_elements(By.ID, "main-tab"):
+            try:
+                click_id(driver, "main-tab")
+                wait_busy_gone(driver, timeout=15)
+                sleep(0.25)
+            except Exception:
+                pass
+        ensure_claim_dates_present(driver, row.begin, row.end, why=f"после main для ДН={code}")
+    dn_map = dn_labels if dn_labels is not None else load_dn_labels()
+    logger.warning("Ставим ДН={} ({}) на диагнозы", code, why or "fix")
+    if not fill_dn_field(driver, 0, code, dn_map):
+        logger.warning("ДН[0]={} не заполнен", code)
+    for i, (dx, dn) in enumerate(row.extra_diagnoses, start=1):
+        if not dx or not driver.find_elements(By.ID, f"is-dispensary-observation-{i}"):
+            continue
+        if (normalize_dn(dn) or dn) == code:
+            if not fill_dn_field(driver, i, code, dn_map):
+                logger.warning("ДН[{}]={} не заполнен", i, code)
+
+
+def dn_for_exam_type(exam_type: str, dn: str) -> str:
+    """ОПВ: «Состоит»(1) → «Состоит, проведено»(7). ДВ4 без изменений."""
+    code = normalize_dn(dn) or (dn or "").strip()
+    if (exam_type or "").strip().lower() == "opv" and code == "1":
+        return "7"
+    return code or (dn or "").strip()
+
+
+def _is_opv_dn_consists_error(msg: str) -> bool:
+    """ОМС: пациент уже состоит на ДН по диагнозу — для ОПВ нужен код 7."""
+    low = (msg or "").lower()
+    if not low:
+        return False
+    has_consist = any(
+        x in low
+        for x in (
+            "состоит",
+            "состоит на",
+            "диспансерн",
+            "уже взят",
+            "взят на дн",
+            "находится на дн",
+            "группа дн",
+        )
     )
-    for xp in xpaths:
-        els = driver.find_elements(By.XPATH, xp)
-        if not els:
+    has_dx = any(x in low for x in ("диагноз", "мкб", "дн", "наблюден"))
+    # частые формулировки ОМС / claim-error
+    if "состоит" in low and ("диагноз" in low or "дн" in low or "наблюден" in low):
+        return True
+    if has_consist and has_dx:
+        return True
+    if "не подлежит" in low and "состоит" in low:
+        return True
+    return False
+
+
+def apply_opv_dn7(
+    driver: WebDriver,
+    row: TalonRow,
+    dn_labels: dict[str, str] | None,
+) -> None:
+    """Поставить ДН=7 на основной и сопутствующие (где был 1/3/пусто с диагнозом)."""
+    row.dn = "7"
+    new_extras: list[tuple[str, str]] = []
+    for dx, dn in row.extra_diagnoses:
+        code = normalize_dn(dn) or (dn or "").strip()
+        if dx and code in ("", "1", "3"):
+            new_extras.append((dx, "7"))
+        else:
+            new_extras.append((dx, dn))
+    row.extra_diagnoses = new_extras
+    # на main только если поля ДН нет на текущем экране — main-tab сбрасывает даты
+    if not driver.find_elements(By.ID, "is-dispensary-observation-0"):
+        if driver.find_elements(By.ID, "main-tab"):
+            try:
+                click_id(driver, "main-tab")
+                wait_busy_gone(driver, timeout=15)
+                sleep(0.25)
+            except Exception:
+                pass
+        ensure_claim_dates_present(driver, row.begin, row.end, why="после main для ДН=7")
+    dn_map = dn_labels if dn_labels is not None else load_dn_labels()
+    # основной
+    if not fill_dn_field(driver, 0, "7", dn_map):
+        logger.warning("ОПВ: не удалось выставить ДН[0]=7")
+    for i, (dx, dn) in enumerate(row.extra_diagnoses, start=1):
+        if not dx or not driver.find_elements(By.ID, f"is-dispensary-observation-{i}"):
             continue
+        if (normalize_dn(dn) or dn) == "7":
+            if not fill_dn_field(driver, i, "7", dn_map):
+                logger.warning("ОПВ: не удалось выставить ДН[{}]=7", i)
+
+
+def fill_dn_field(
+    driver: WebDriver,
+    index: int,
+    dn: str,
+    dn_labels: dict[str, str] | None = None,
+) -> bool:
+    """Заполнить is-dispensary-observation-{i} по справочнику ДН (код → подпись)."""
+    variants = dn_search_texts(dn, dn_labels)
+    if not variants:
+        return False
+
+    els = driver.find_elements(By.ID, f"is-dispensary-observation-{index}")
+    targets = list(els)
+    if index == 0 and not targets:
+        for xp in (
+            "//div[contains(.,'Диспансерное наблюдение')]"
+            "//input[contains(@id,'react-select') or @type='text']",
+            "//label[contains(.,'Диспансерное')]/following::input[1]",
+        ):
+            targets.extend(driver.find_elements(By.XPATH, xp))
+    if not targets:
+        logger.warning("Поле ДН[{}] не найдено", index)
+        return False
+
+    el = targets[0]
+    last_exc: Exception | None = None
+    for text in variants:
         try:
-            fill_react_select_input(driver, els[0], dn)
-            logger.info("ДН заполнен через fallback")
-            return
-        except Exception:
+            fill_react_select_input(driver, el, text)
+            logger.info("ДН[{}] подпись «{}» (из кода {})", index, text, normalize_dn(dn) or dn)
+            return True
+        except Exception as exc:
+            last_exc = exc
             continue
-    logger.warning("Поле ДН не найдено")
+    if last_exc:
+        logger.debug("ДН[{}] ошибки вариантов: {}", index, last_exc)
+    return False
+
+
+def _try_fill_dn_fallback(driver: WebDriver, dn: str) -> None:
+    """Совместимость: ДН через xpath, если id не найден."""
+    fill_dn_field(driver, 0, dn)
 
 
 def _tab_is_enabled(driver: WebDriver, tab_id: str) -> bool:
@@ -1578,6 +2177,64 @@ def fill_purposes(driver: WebDriver, row: TalonRow) -> None:
                 f"Не удалось заполнить referenceSpecialityId (к кому) = {row.purpose_to!r}"
             )
         sleep(0.2)
+
+    # Дата направления * = окончание талона → #referenceDate
+    purpose_date = (row.end or "").strip()
+    if not purpose_date:
+        logger.warning("Нет даты окончания — дата направления не заполнена")
+    else:
+        text = normalize_service_date(purpose_date)
+        logger.info("Дата направления (из окончания) = {}", text)
+        filled_date = False
+        for pid in ("referenceDate", "reference-date"):
+            els = driver.find_elements(By.ID, pid)
+            if not els:
+                continue
+            try:
+                # клик по контейнеру — иначе input «not reachable by keyboard»
+                wrap = els[0]
+                try:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});"
+                        "const p = arguments[0].closest('div');"
+                        "if (p) p.click();",
+                        wrap,
+                    )
+                    sleep(0.2)
+                except Exception:
+                    pass
+                _set_input_value(driver, els[0], text)
+                actual = (els[0].get_attribute("value") or "").strip()
+                logger.info("{} = {} (force)", pid, actual or "пусто")
+                filled_date = bool(actual)
+                if filled_date:
+                    break
+            except Exception as exc:
+                logger.debug("purpose date {}: {}", pid, exc)
+        if not filled_date:
+            logger.warning("Дата направления не заполнена (#referenceDate)")
+
+
+def fill_date_field_el(driver: WebDriver, el, value: str) -> None:
+    """Заполнить date input по элементу — всегда DD-MM-YY."""
+    text = normalize_service_date(value)
+    if not text:
+        return
+    digits = re.sub(r"\D", "", text)
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+    sleep(0.1)
+    try:
+        el.click()
+    except Exception:
+        driver.execute_script("arguments[0].focus();", el)
+    el.send_keys(Keys.CONTROL, "a")
+    el.send_keys(Keys.BACKSPACE)
+    for ch in digits:
+        el.send_keys(ch)
+        sleep(0.03)
+    _set_input_value(driver, el, text)
+    el.send_keys(Keys.TAB)
+    sleep(0.15)
 
 
 def open_services_tab(driver: WebDriver) -> None:
@@ -1750,7 +2407,21 @@ def fill_service_doctor(driver: WebDriver, index: int, doctor: str) -> None:
 
 def fill_service_done(driver: WebDriver, index: int, value: str) -> None:
     el = driver.find_element(By.ID, f"combobox-failure-services-{index}")
-    fill_react_select_input(driver, el, value or DEFAULT_DONE)
+    text = normalize_service_done(value)
+    # ОМС может писать «Перезачёт» с ё
+    variants = [text]
+    if text == "Перезачет":
+        variants.append("Перезачёт")
+    logger.info("Услуга[{}] Выполнено ← «{}»", index, text)
+    last_exc: Exception | None = None
+    for v in variants:
+        try:
+            fill_react_select_input(driver, el, v)
+            return
+        except Exception as exc:
+            last_exc = exc
+    if last_exc:
+        raise last_exc
 
 
 def fill_service_date(driver: WebDriver, index: int, date_text: str) -> None:
@@ -1801,6 +2472,7 @@ def fill_services(
     driver: WebDriver,
     row: TalonRow,
     catalog: DoctorCatalog,
+    recredit_rules: dict | None = None,
 ) -> int:
     open_services_tab(driver)
     indices = list_service_indices(driver)
@@ -1809,6 +2481,8 @@ def fill_services(
         return 0
 
     date_for_services = row.end or row.begin
+    done_default = normalize_service_done(row.done_value)
+    rules = recredit_rules if recredit_rules is not None else load_recredit_rules()
     filled = 0
     for i in indices:
         last_exc: Exception | None = None
@@ -1821,12 +2495,33 @@ def fill_services(
                     service_code=code,
                     main_doctor=row.doctor,
                 )
+                done_val, svc_date, rr = resolve_service_done_and_date(
+                    rules,
+                    exam_type=row.exam_type,
+                    service_code=code,
+                    end_date=date_for_services,
+                    default_done=done_default,
+                )
                 if attempt == 1:
-                    logger.info("Услуга[{}] code={} doctor={}", i, code or "—", doctor)
+                    src = "справочник" if doctor and doctor != (row.doctor or "").strip() else (
+                        "карта" if doctor else "пусто"
+                    )
+                    extra = ""
+                    if rr is not None:
+                        extra = f" | перезачет={done_val!r} дата={svc_date} (−{rr.months_back}м, {rr.name or code})"
+                    logger.info(
+                        "Услуга[{}] code={} doctor={} [{}] корпус={}{}",
+                        i,
+                        code or "—",
+                        doctor or "—",
+                        src,
+                        row.building or "—",
+                        extra,
+                    )
                 # врач и «Выполнено» сначала — дата последней (иначе сбрасывается)
                 fill_service_doctor(driver, i, doctor)
-                fill_service_done(driver, i, "Да")
-                fill_service_date(driver, i, date_for_services)
+                fill_service_done(driver, i, done_val)
+                fill_service_date(driver, i, svc_date)
                 filled += 1
                 last_exc = None
                 break
@@ -1847,6 +2542,8 @@ def process_row(
     index: int,
     catalog: DoctorCatalog,
     dry_run: bool,
+    dn_labels: dict[str, str] | None = None,
+    recredit_rules: dict | None = None,
 ) -> RowResult:
     t0 = time()
     logger.info("=== [{}] {} {} ===", index, row.exam_type.upper(), row.enp)
@@ -1854,11 +2551,14 @@ def process_row(
         open_exam_form(driver, row.exam_type)
         fill_patient_and_search(driver, row)
         ensure_patient_social_status(driver, row)
-        # не переоткрываем форму — save карты оставляет нас на medicalExamination
-        fill_main_page(driver, row)
+        # карта пациента / лишний main-tab могли стереть begin/end — вернуть ТОЛЬКО если пусто
+        ensure_claim_dates_present(driver, row.begin, row.end, why="после карты пациента")
+        fill_main_page(driver, row, dn_labels=dn_labels)
+        # ещё раз перед услугами: fill_main не должен трогать даты, но ОМС бывает капризный
+        ensure_claim_dates_present(driver, row.begin, row.end, why="перед услугами")
 
         # После заполнения карты вкладка Услуги обычно уже активна («Услуги получены»)
-        n_svc = fill_services(driver, row, catalog)
+        n_svc = fill_services(driver, row, catalog, recredit_rules=recredit_rules)
         # Результат III группы / пустые наз_* в Excel → всё равно заполняем назначения
         ensure_default_purposes(row)
         if (row.purpose_type or "").strip() or _tab_is_enabled(driver, "purposes-tab"):
@@ -1875,21 +2575,69 @@ def process_row(
             logger.success("[{}] {}", index, msg)
             return RowResult(index, row.enp, row.exam_type, "dry_run", msg, n_svc, round(time() - t0, 2))
 
-        ok, msg = save_claim(driver)
+        ok, msg = save_claim(driver, begin=row.begin, end=row.end)
         if (not ok) and purposes_required_message(msg):
             logger.warning("[{}] ОМС требует назначения — заполняем и повторяем Save", index)
             row.purpose_type = row.purpose_type or DEFAULT_PURPOSE_TYPE
             row.purpose_from = row.purpose_from or DEFAULT_PURPOSE_FROM
             row.purpose_to = row.purpose_to or DEFAULT_PURPOSE_TO
             fill_purposes(driver, row)
-            ok, msg = save_claim(driver)
+            ok, msg = save_claim(driver, begin=row.begin, end=row.end)
         if (not ok) and _is_social_status_error(msg):
-            logger.warning("[{}] ошибка соцстатуса — правим карту пациента и повторяем", index)
+            logger.warning("[{}] ошибка соцстатуса/занятости — открываем карту пациента и повторяем", index)
+            # сбросить «из Excel» нельзя — ensure всё равно пишет в карту; force пересчёт если пусто
             ensure_patient_social_status(driver, row)
-            fill_main_page(driver, row)
-            n_svc = fill_services(driver, row, catalog)
+            ensure_claim_dates_present(driver, row.begin, row.end, why="после соцстатуса retry")
+            fill_main_page(driver, row, dn_labels=dn_labels)
+            ensure_claim_dates_present(driver, row.begin, row.end, why="перед услугами retry")
+            n_svc = fill_services(driver, row, catalog, recredit_rules=recredit_rules)
             fill_purposes(driver, row)
-            ok, msg = save_claim(driver)
+            ok, msg = save_claim(driver, begin=row.begin, end=row.end)
+        # Недопустимое ДН / зависший диалог пациента → НАЗАД уже нажали → «Состоит» → Save
+        if (not ok) and _needs_dn_consists_fix(msg):
+            et = (row.exam_type or "").lower()
+            want = "7" if et == "opv" else "1"
+            # если уже Состоит и снова та же ошибка — для ДВ4 всё равно ещё раз выставим подпись
+            logger.warning(
+                "[{}] ДН/диалог пациента — ставим {} ({}) на форме и Save снова ({})",
+                index,
+                want,
+                "Состоит, проведено" if want == "7" else "Состоит",
+                (msg or "")[:200],
+            )
+            # закрыть хвосты диалога, если остались
+            try:
+                if find_visible_dialogs(driver) or warning_dialog_text(driver):
+                    dismiss_warning_dialog(driver)
+            except Exception:
+                pass
+            apply_dn_code(driver, row, want, dn_labels, why="retry после НАЗАД/ошибки ДН")
+            if _is_social_status_error(msg):
+                ensure_patient_social_status(driver, row)
+                ensure_claim_dates_present(driver, row.begin, row.end, why="ДН+соц retry")
+            # услуги не перезаполняем — только Save с услуг
+            if driver.find_elements(By.ID, "services-tab"):
+                try:
+                    click_id(driver, "services-tab")
+                    wait_busy_gone(driver, timeout=15)
+                    sleep(0.25)
+                except Exception:
+                    pass
+            ok, msg = save_claim(driver, begin=row.begin, end=row.end)
+        # ОПВ: «состоит по диагнозу» / неверный код ДН → ставим 7 и Save ещё раз
+        if (
+            (not ok)
+            and (row.exam_type or "").lower() == "opv"
+            and _is_opv_dn_consists_error(msg)
+            and (normalize_dn(row.dn) or row.dn or "") != "7"
+        ):
+            logger.warning(
+                "[{}] ОПВ: ошибка ДН/«состоит» — ставим ДН=7 и повторяем Save ({})",
+                index,
+                (msg or "")[:160],
+            )
+            apply_opv_dn7(driver, row, dn_labels)
+            ok, msg = save_claim(driver, begin=row.begin, end=row.end)
         status = "ok" if ok else "fail"
         log = logger.success if ok else logger.error
         log("[{}] {} → {} ({:.1f}s)", index, status.upper(), msg, time() - t0)
@@ -1965,7 +2713,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--type", type=str, default="", help="Принудительно ДВ4 или ОПВ для всех строк")
-    p.add_argument("--catalog", type=Path, default=WORK_DIR / "data" / "doctors_by_building.xlsx")
+    p.add_argument(
+        "--catalog",
+        type=Path,
+        default=DEFAULT_REFERENCE,
+        help="Справочник ДВ4/ОПВ (листы «ДН» и «справочник_врачей»)",
+    )
     p.add_argument("--dry-run", action="store_true", help="Заполнить форму без Save")
     p.add_argument("--keep-open", type=int, default=0)
     p.add_argument("--make-template", action="store_true")
@@ -1997,15 +2750,22 @@ def main() -> int:
         rows = rows[: args.limit]
 
     catalog = DoctorCatalog.load_for_talons_file(args.file, fallback=args.catalog)
+    dn_labels = load_dn_labels(args.catalog)
+    if not dn_labels:
+        dn_labels = load_dn_labels(DEFAULT_REFERENCE)
+    recredit_rules = load_recredit_rules(args.catalog)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     result_path = RESULTS_DIR / f"dv_opv_result_{stamp}_o{args.offset}.csv"
 
+    catalog_src = Path(catalog.source).name if catalog.source else str(args.catalog)
     logger.info(
-        "Строк: {} | dry_run={} | каталог правил врачей: {} (из {})",
+        "Строк: {} | dry_run={} | врачи: {} правил ({}) | ДН: {} | перезачет: {} кодов",
         len(rows),
         args.dry_run,
         len(catalog.rules),
-        args.file.name if catalog.rules else args.catalog,
+        catalog_src,
+        len(dn_labels),
+        len(recredit_rules),
     )
     results: list[RowResult] = []
     t_all = time()
@@ -2013,12 +2773,36 @@ def main() -> int:
     with GeckoBrowser(implicit_wait=0) as session:
         driver = session.driver
         driver.implicitly_wait(0)
-        login_oms(driver)
-        sleep(0.8)
-        wait_busy_gone(driver)
+        last_login_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                login_oms(driver)
+                sleep(1.2)
+                wait_busy_gone(driver, timeout=45)
+                # признак успешного входа — ушли с /login или есть меню
+                url = (driver.current_url or "").lower()
+                if "login" in url and attempt < 3:
+                    raise RuntimeError(f"всё ещё login url={url}")
+                last_login_exc = None
+                logger.info("OMS login OK (attempt {})", attempt)
+                break
+            except Exception as exc:
+                last_login_exc = exc
+                logger.warning("OMS login fail attempt {}/3: {}", attempt, exc)
+                sleep(2.5 * attempt)
+        if last_login_exc is not None:
+            raise RuntimeError(f"Не удалось авторизоваться в ОМС: {last_login_exc}") from last_login_exc
 
         for i, row in enumerate(rows, start=1 + args.offset):
-            res = process_row(driver, row, index=i, catalog=catalog, dry_run=args.dry_run)
+            res = process_row(
+                driver,
+                row,
+                index=i,
+                catalog=catalog,
+                dry_run=args.dry_run,
+                dn_labels=dn_labels,
+                recredit_rules=recredit_rules,
+            )
             results.append(res)
 
         if args.keep_open > 0:

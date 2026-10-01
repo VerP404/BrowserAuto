@@ -107,18 +107,21 @@ cd D:\Projects\BrowserAuto
 
 ---
 
-## Справочник врачей по корпусу (заготовка)
+## Справочник ДВ4 и ОПВ
 
-Файл: `robots/oms/dv_opv/data/doctors_by_building.xlsx` (создаётся `--make-template`).
+Файл: `robots/oms/dv_opv/Справочник ДВ4 и ОПВ.xlsx` (по умолчанию для `--catalog`).
 
-Сейчас **все услуги** получают врача из колонки «врач» карты (если она заполнена).  
-Когда подготовите справочник — робот начнёт подставлять:
+Листы:
+- **ДН** — код → подпись группы (`1 Состоит`, `3 Не подлежит`, …). Робот вводит в ОМС подпись, не голый код.
+- **справочник_врачей** — `корпус | код_услуги | роль | врач`. Для каждой услуги ищется врач по корпусу талона + коду услуги; если правила нет — основной врач карты.
 
-- точный код услуги + корпус → конкретный врач  
-- `A09.05.%` / `*` → группа  
-- роль `therapist` + пустой врач → врач карты  
+```powershell
+.\.venv\Scripts\python run_medical_exam.py --file robots\oms\dv_opv\data\talons_dv_opv_doc_30151001.xlsx --limit 1
+# явный путь:
+.\.venv\Scripts\python run_medical_exam.py --catalog "robots\oms\dv_opv\Справочник ДВ4 и ОПВ.xlsx"
+```
 
-Логика: `doctors_catalog.py` → `resolve_service_doctor()`.
+Логика: `doctors_catalog.py` → `resolve_service_doctor()`, `load_dn_labels()`, `dn_search_texts()`.
 
 ---
 
