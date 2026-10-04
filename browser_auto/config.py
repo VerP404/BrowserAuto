@@ -25,18 +25,42 @@ def _apply_env() -> None:
     BROWSER_IMPLICIT_WAIT = int(os.getenv("BROWSER_IMPLICIT_WAIT", "10"))
 
 
+def _is_placeholder(value: str) -> bool:
+    v = (value or "").strip().lower()
+    if not v:
+        return True
+    return v.startswith("your_") or v in {
+        "changeme",
+        "change_me",
+        "xxx",
+        "todo",
+        "password",
+        "login",
+    }
+
+
 def load_credentials(*extra_env_files: Path | str) -> None:
     """
-    Загрузка секретов:
-      1) BrowserAuto/.env
-      2) дополнительные файлы (например credentials.env рядом со скриптом) — с override
+    Загрузка секретов. Приоритет у BrowserAuto/.env.
+
+    Порядок:
+      1) robot credentials.env (если есть) — только ключи, которых ещё нет
+      2) BrowserAuto/.env — override=True (рабочие логины всегда главнее)
+      3) выкинуть плейсхолдеры your_* и снова наложить .env
+
+    Иначе копия credentials.env.example с your_oms_login затирала .env.
     """
-    if ENV_FILE.is_file():
-        load_dotenv(ENV_FILE, override=False)
     for raw in extra_env_files:
         path = Path(raw)
         if path.is_file():
-            load_dotenv(path, override=True)
+            load_dotenv(path, override=False)
+    if ENV_FILE.is_file():
+        load_dotenv(ENV_FILE, override=True)
+    for key in ("OMS_LOGIN", "OMS_PASSWORD", "ISZL_LOGIN", "ISZL_PASSWORD"):
+        if _is_placeholder(os.getenv(key, "")):
+            os.environ.pop(key, None)
+    if ENV_FILE.is_file():
+        load_dotenv(ENV_FILE, override=True)
     _apply_env()
 
 
