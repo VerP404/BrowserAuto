@@ -17,4 +17,5 @@ if not SCRIPT.is_file():
 sys.argv[0] = str(SCRIPT)
 sys.path.insert(0, str(SCRIPT.parent))
 sys.path.insert(0, str(SCRIPT.parent.parent / "dv_opv"))
+sys.path.insert(0, str(SCRIPT.parent.parent / "cel_307"))
 runpy.run_path(str(SCRIPT), run_name="__main__")

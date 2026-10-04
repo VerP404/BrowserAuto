@@ -1,13 +1,15 @@
-# Убрать «Место прохождения диспансеризации» с готовых талонов.
+# Исправление диагноза (ds1) в амбулаторных талонах
 
 Папка: `robots/oms/form_diagnosis/`
 
 ## Что делает
 
-1. Читает Excel: **Талон** (id) + **Цель** (ДВ4/ОПВ)
-2. Открывает `http://10.36.0.142:9000/claim/medicalExamination/{id}`
-3. Очищает `#medicalExaminationPlace` (ничего туда не пишет)
-4. Жмёт Save (`#id-save`) и подтверждает диалоги как в dv_opv
+1. Читает Excel: **Талон** + **ds1** (или `--diagnosis`, если колонки нет)
+2. Открывает `{OMS}/claim/ambulatory/{Талон}`
+3. Ставит `#mainDiagnosis` = ds1
+4. Жмёт Save (как в cel_307)
+
+> Ранее сюда временно положили очистку `medicalExaminationPlace` — она сохранена в `form_clear_place.py`.
 
 ## Запуск
 
@@ -15,13 +17,20 @@
 cd D:\Projects\BrowserAuto
 copy robots\oms\form_diagnosis\credentials.env.example robots\oms\form_diagnosis\credentials.env
 
-# проверить 1 талон без сохранения
-.\.venv\Scripts\python run_form_diagnosis.py --limit 1 --dry-run --keep-open 20
+# тест без Save
+.\.venv\Scripts\python run_form_diagnosis.py --file robots\oms\form_diagnosis\data\Книга15.xlsx --limit 1 --dry-run --keep-open 20
 
-# боевой прогон
-.\.venv\Scripts\python run_form_diagnosis.py --file robots\oms\form_diagnosis\data\ubrat_mesto.xlsx
+# боевой
+.\.venv\Scripts\python run_form_diagnosis.py --file robots\oms\form_diagnosis\data\Книга15.xlsx
+
+# если в Excel только колонка «Талон»:
+.\.venv\Scripts\python run_form_diagnosis.py --file ...\Книга15.xlsx --diagnosis Z72.4
 ```
 
-Файл по умолчанию: `data/ubrat_mesto.xlsx` (копия `robots/oms/убрать место.xlsx`).
+Параллельно:
 
-Результат: `robots/oms/form_diagnosis/data/clear_place_result_*.csv`.
+```powershell
+.\robots\oms\form_diagnosis\run_parallel.ps1 -Workers 5 -File "D:\Projects\BrowserAuto\robots\oms\form_diagnosis\data\Книга15.xlsx"
+```
+
+Результат: `robots/oms/form_diagnosis/data/fix_diagnosis_result_*.csv`.
