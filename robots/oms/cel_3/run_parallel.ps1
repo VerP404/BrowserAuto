@@ -3,8 +3,8 @@
 # Примеры (из корня BrowserAuto):
 #   .\robots\oms\cel_3\run_parallel.ps1 -Workers 5
 #   .\robots\oms\cel_3\run_parallel.ps1 -Workers 5 -Talons "...\талоны.xlsx" -Services "...\услуги.xlsx"
-#   .\robots\oms\cel_3\run_parallel.ps1 -Workers 5 -Category ""   # все категории
-#   .\robots\oms\cel_3\run_parallel.ps1 -Workers 5 -Category "БСК" -LimitPerWorker 10
+#   .\robots\oms\cel_3\run_parallel.ps1 -Workers 5                  # все категории
+#   .\robots\oms\cel_3\run_parallel.ps1 -Workers 5 -Category "BSK"  # только БСК
 
 param(
     [int]$Workers = 5,
@@ -14,7 +14,8 @@ param(
     [string]$Services = "",
     [string]$Building = "",
     [string]$Doctor = "",
-    [string]$Category = "БСК",
+    # Пусто = все категории. ASCII-алиас BSK = БСК.
+    [string]$Category = "",
     [int]$StaggerMs = 4000
 )
 
@@ -22,6 +23,7 @@ $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
 $Py = Join-Path $Root ".venv\Scripts\python.exe"
 $Launcher = Join-Path $Root "run_3.py"
+$CountPy = Join-Path $PSScriptRoot "_count_talons.py"
 $DataDir = Join-Path $PSScriptRoot "data"
 $LogDir = Join-Path $DataDir "logs"
 $TalonsXlsx = if ($Talons) { (Resolve-Path $Talons).Path } else { Join-Path $DataDir "талоны.xlsx" }
@@ -29,47 +31,34 @@ $ServicesXlsx = if ($Services) { (Resolve-Path $Services).Path } else { Join-Pat
 
 if (-not (Test-Path $Py)) { throw "Нет venv: $Py" }
 if (-not (Test-Path $Launcher)) { throw "Нет лаунчера: $Launcher" }
+if (-not (Test-Path $CountPy)) { throw "Нет счётчика: $CountPy" }
 if (-not (Test-Path $TalonsXlsx)) { throw "Нет Excel талонов: $TalonsXlsx" }
 if (-not (Test-Path $ServicesXlsx)) { throw "Нет Excel услуг: $ServicesXlsx" }
 
+# UTF-8 для Python (кириллица в argv / stdout)
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+
+# Нормализация алиасов категории
+$CategoryNorm = $Category
+if ($CategoryNorm -eq "BSK" -or $CategoryNorm -eq "bsk") { $CategoryNorm = "БСК" }
+if ($CategoryNorm -eq "ONKO" -or $CategoryNorm -eq "onko") { $CategoryNorm = "ОНКО" }
+if ($CategoryNorm -eq "SD" -or $CategoryNorm -eq "sd") { $CategoryNorm = "СД" }
+
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
-# Считаем строки ПОСЛЕ фильтра Категория (как в add_3.load_talons_bundle)
-$talonsPy = $TalonsXlsx.Replace("\", "\\")
-$catPy = $Category.Replace("\", "\\").Replace("'", "''")
-$total = & $Py -c @"
-from openpyxl import load_workbook
-wb = load_workbook(r'$talonsPy', read_only=True, data_only=True)
-ws = wb.active
-rows = ws.iter_rows(values_only=True)
-headers = [str(h or '').strip().lower() for h in next(rows)]
-i_enp = next((i for i,h in enumerate(headers) if h in ('енп','enp')), None)
-i_cat = next((i for i,h in enumerate(headers) if h == 'категория'), None)
-cat = '$catPy'.strip().lower()
-n = 0
-for raw in rows:
-    if not raw or i_enp is None:
-        continue
-    enp = raw[i_enp]
-    if enp is None or str(enp).strip() == '':
-        continue
-    if cat and i_cat is not None:
-        c = str(raw[i_cat] or '').strip().lower()
-        if c != cat:
-            continue
-    n += 1
-wb.close()
-print(n)
-"@
+$total = & $Py $CountPy $TalonsXlsx $CategoryNorm
+if ($LASTEXITCODE -ne 0) { throw "Не удалось посчитать строки талонов" }
 $total = [int]$total
 $remaining = [Math]::Max($total - $StartOffset, 0)
 if ($remaining -le 0) {
-    Write-Host "Нечего обрабатывать: total=$total startOffset=$StartOffset category=$Category"
+    Write-Host "Нечего обрабатывать: total=$total startOffset=$StartOffset category=$CategoryNorm"
+    Write-Host "Подсказка: -Category '' (все) или -Category BSK (ASCII = БСК)"
     exit 0
 }
 
 $chunk = [int][Math]::Ceiling($remaining / [double]$Workers)
-Write-Host "total=$total startOffset=$StartOffset remaining=$remaining workers=$Workers chunk=$chunk category=$Category"
+Write-Host "total=$total startOffset=$StartOffset remaining=$remaining workers=$Workers chunk=$chunk category=$CategoryNorm"
 Write-Host "talons=$TalonsXlsx"
 Write-Host "services=$ServicesXlsx"
 
@@ -99,9 +88,9 @@ for ($w = 0; $w -lt $Workers; $w++) {
         "--offset", "$offset",
         "--limit", "$limit",
         "--window-x", "$x",
-        "--window-y", "$y"
+        "--window-y", "$y",
+        "--category", $CategoryNorm
     )
-    if ($null -ne $Category) { $argList += @("--category", $Category) }
     if ($Building) { $argList += @("--building", $Building) }
     if ($Doctor) { $argList += @("--doctor", $Doctor) }
 

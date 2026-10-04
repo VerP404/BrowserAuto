@@ -14,15 +14,15 @@ copy robots\oms\cel_3\credentials.env.example robots\oms\cel_3\credentials.env
   --services robots\oms\cel_3\data\услуги.xlsx `
   --category БСК --limit 1
 
-# 5 воркеров (по умолчанию фильтр Категория=БСК)
+# 5 воркеров — все категории (по умолчанию)
 .\robots\oms\cel_3\run_parallel.ps1 -Workers 5 `
   -Talons "D:\Projects\BrowserAuto\robots\oms\cel_3\data\талоны.xlsx" `
   -Services "D:\Projects\BrowserAuto\robots\oms\cel_3\data\услуги.xlsx"
 
-# все категории:
-.\robots\oms\cel_3\run_parallel.ps1 -Workers 5 -Category ""
+# только БСК:
+.\robots\oms\cel_3\run_parallel.ps1 -Workers 5 -Category BSK
 ```
 
-По умолчанию `--category БСК` (в файле ~2605 строк БСК из ~5954).  
+По умолчанию **все категории**.  
 Результат: `robots/oms/cel_3/data/oms_3_result_*.csv`.  
 Логи: `robots/oms/cel_3/data/logs/w*.err.log`.
