@@ -77,6 +77,13 @@ Write-Host "total=$total startOffset=$StartOffset remaining=$remaining workers=$
 Write-Host "file=$Xlsx"
 Write-Host "catalog=$Cat"
 
+function Quote-WinArg([string]$s) {
+    # Start-Process joins -ArgumentList without quotes → paths with spaces break.
+    if ($null -eq $s) { return '""' }
+    if ($s -notmatch '[\s"]') { return $s }
+    return '"' + ($s -replace '"', '\"') + '"'
+}
+
 $procs = @()
 for ($w = 0; $w -lt $Workers; $w++) {
     $offset = $StartOffset + ($w * $chunk)
@@ -93,18 +100,19 @@ for ($w = 0; $w -lt $Workers; $w++) {
     $errLog = Join-Path $LogDir "$worker.err.log"
     Remove-Item $outLog, $errLog -Force -ErrorAction SilentlyContinue
 
-    $argList = @(
+    $argLine = @(
         $Launcher,
         "--file", $Xlsx,
         "--catalog", $Cat,
         "--offset", "$offset",
         "--limit", "$limit"
-    )
+    ) | ForEach-Object { Quote-WinArg $_ }
+    $argLine = $argLine -join ' '
 
     Write-Host "Start $worker offset=$offset limit=$limit"
 
     $p = Start-Process -FilePath $Py `
-        -ArgumentList $argList `
+        -ArgumentList $argLine `
         -WorkingDirectory $Root `
         -RedirectStandardOutput $outLog `
         -RedirectStandardError $errLog `
