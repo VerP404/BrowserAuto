@@ -95,7 +95,9 @@ for ($w = 0; $w -lt $Workers; $w++) {
     $errLog = Join-Path $LogDir "$worker.err.log"
     Remove-Item $outLog, $errLog -Force -ErrorAction SilentlyContinue
 
-    $argList = @(
+    # Start-Process rejects empty strings in -ArgumentList (e.g. --category "")
+    $argList = [System.Collections.Generic.List[string]]::new()
+    $argList.AddRange([string[]]@(
         $Launcher,
         "--talons", $TalonsXlsx,
         "--services", $ServicesXlsx,
@@ -103,16 +105,16 @@ for ($w = 0; $w -lt $Workers; $w++) {
         "--offset", "$offset",
         "--limit", "$limit",
         "--window-x", "$x",
-        "--window-y", "$y",
-        "--category", $CategoryNorm
-    )
-    if ($Building) { $argList += @("--building", $Building) }
-    if ($Doctor) { $argList += @("--doctor", $Doctor) }
+        "--window-y", "$y"
+    ))
+    if ($CategoryNorm) { $argList.AddRange([string[]]@("--category", $CategoryNorm)) }
+    if ($Building) { $argList.AddRange([string[]]@("--building", $Building)) }
+    if ($Doctor) { $argList.AddRange([string[]]@("--doctor", $Doctor)) }
 
     Write-Host "Start $worker offset=$offset limit=$limit window=($x,$y)"
 
     $p = Start-Process -FilePath $Py `
-        -ArgumentList $argList `
+        -ArgumentList $argList.ToArray() `
         -WorkingDirectory $Root `
         -RedirectStandardOutput $outLog `
         -RedirectStandardError $errLog `

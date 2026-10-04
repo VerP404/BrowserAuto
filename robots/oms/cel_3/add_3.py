@@ -255,6 +255,13 @@ def load_talons_bundle(
         )
 
     cat_filter = (category or "").strip().lower()
+    # ASCII aliases from run_parallel.ps1
+    if cat_filter == "bsk":
+        cat_filter = "бск"
+    elif cat_filter == "onko":
+        cat_filter = "онко"
+    elif cat_filter == "sd":
+        cat_filter = "сд"
     out: list[Talon3] = []
     for n, raw in enumerate(trows, start=2):
         tid = base._cell(raw[i_id])
@@ -642,7 +649,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--zip", type=Path, default=None, help="Архив talon_bundle_*.zip")
     p.add_argument("--talons", type=Path, default=None)
     p.add_argument("--services", type=Path, default=None)
-    p.add_argument("--category", default="БСК", help="Фильтр Категория (пусто = все)")
+    p.add_argument(
+        "--category",
+        default="",
+        help="Фильтр Категория (пусто = все; BSK/БСК, ONKO/ОНКО, SD/СД)",
+    )
     p.add_argument("--doctor", default="", help="Врач по умолчанию, если в Excel пусто")
     p.add_argument("--building", default="", help="Корпус по умолчанию")
     p.add_argument("--limit", type=int, default=0)
