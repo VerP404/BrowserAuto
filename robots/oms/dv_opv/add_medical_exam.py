@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 """
-Ввод талонов ДВ4 / ОПВ в Web.ОМС (medicalExamination).
+Ввод талонов ДВ4 / ОПВ / УД1 в Web.ОМС (medicalExamination).
 
 URL:
   ДВ4 → /claim/medicalExamination/dv4
   ОПВ → /claim/medicalExamination/opv
+  УД1 → /claim/medicalExamination/ud1
 
 Страница 1: даты начала/окончания (по ним подбираются услуги), ЕНП, врач, результат,
 место обращения (#service-place=1), период, диагноз, ДН.
@@ -67,6 +68,9 @@ URL_BY_TYPE = {
     "опв": "/claim/medicalExamination/opv",
     "opv": "/claim/medicalExamination/opv",
     "дв4": "/claim/medicalExamination/dv4",
+    "ud1": "/claim/medicalExamination/ud1",
+    "уд1": "/claim/medicalExamination/ud1",
+    "уд-1": "/claim/medicalExamination/ud1",
 }
 
 # Место обращения (посещения) #service-place = 1.
@@ -116,7 +120,7 @@ class TalonRow:
     enp: str
     begin: str
     end: str
-    exam_type: str  # dv4 | opv
+    exam_type: str  # dv4 | opv | ud1
     doctor: str
     result: str
     period: str
@@ -252,7 +256,9 @@ def _norm_type(raw: str) -> str:
         return "dv4"
     if t in ("opv", "опв"):
         return "opv"
-    raise ValueError(f"Неизвестный тип талона: {raw!r} (нужно ДВ4 или ОПВ)")
+    if t in ("ud1", "уд1", "уд-1", "уд 1"):
+        return "ud1"
+    raise ValueError(f"Неизвестный тип талона: {raw!r} (нужно ДВ4, ОПВ или УД1)")
 
 
 def exam_url(exam_type: str) -> str:
@@ -2710,16 +2716,16 @@ def ensure_template(path: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Ввод талонов ДВ4/ОПВ (Web.ОМС medicalExamination)")
+    p = argparse.ArgumentParser(description="Ввод талонов ДВ4/ОПВ/УД1 (Web.ОМС medicalExamination)")
     p.add_argument("--file", type=Path, default=DEFAULT_FILE)
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--offset", type=int, default=0)
-    p.add_argument("--type", type=str, default="", help="Принудительно ДВ4 или ОПВ для всех строк")
+    p.add_argument("--type", type=str, default="", help="Принудительно ДВ4 / ОПВ / УД1 для всех строк")
     p.add_argument(
         "--catalog",
         type=Path,
         default=DEFAULT_REFERENCE,
-        help="Справочник ДВ4/ОПВ (листы «ДН» и «справочник_врачей»)",
+        help="Справочник ДВ4/ОПВ/УД1 (листы «ДН» и «справочник_врачей»)",
     )
     p.add_argument("--dry-run", action="store_true", help="Заполнить форму без Save")
     p.add_argument("--keep-open", type=int, default=0)

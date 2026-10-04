@@ -21,8 +21,15 @@ $LogDir = Join-Path $DataDir "logs"
 $DefaultFile = Join-Path $DataDir "talons_dv_opv_doc_30151001.xlsx"
 
 if (-not $Catalog) {
-    $xlsxHere = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter "*.xlsx" -ErrorAction SilentlyContinue)
-    if ($xlsxHere.Count -ge 1) {
+    # Prefer non-catalog xlsx in robot folder (full dictionary), else catalog_dv_opv.xlsx
+    $xlsxHere = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter "*.xlsx" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notmatch '^~\$' })
+    $dict = @($xlsxHere | Where-Object { $_.Name -notmatch '^catalog_' } | Sort-Object Length -Descending)
+    if ($dict.Count -ge 1) {
+        $Catalog = $dict[0].FullName
+    } elseif (Test-Path -LiteralPath (Join-Path $PSScriptRoot "catalog_dv_opv.xlsx")) {
+        $Catalog = Join-Path $PSScriptRoot "catalog_dv_opv.xlsx"
+    } elseif ($xlsxHere.Count -ge 1) {
         $Catalog = $xlsxHere[0].FullName
     }
 }

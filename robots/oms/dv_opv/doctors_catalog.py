@@ -1,5 +1,5 @@
 """
-Справочник ДВ4/ОПВ: врачи услуг + подписи групп ДН.
+Справочник ДВ4/ОПВ/УД1: врачи услуг + подписи групп ДН.
 
 Источник (по приоритету):
   1) лист «справочник_врачей» / «ДН» в файле талонов
@@ -38,11 +38,23 @@ BUILTIN_DN_LABELS: dict[str, str] = {
 
 # ДВ4: флюорография / ЭКГ / маммография → «Перезачет», дата = окончание − N мес.
 # (если лист «перезачет» в справочнике пуст — используем это)
+# Перезачёт: ДВ4 и УД1 (одинаковая логика исследований)
+_RECREDIT_TYPES = ("dv4", "ud1")
+
 BUILTIN_RECREDIT_CODES: dict[str, dict[str, object]] = {
-    "A06.09.006": {"name": "Флюорография", "done": "Перезачет", "months_back": 1, "exam_types": ("dv4",)},
-    "A05.10.006": {"name": "ЭКГ", "done": "Перезачет", "months_back": 1, "exam_types": ("dv4",)},
-    "A06.20.004": {"name": "Маммография", "done": "Перезачет", "months_back": 1, "exam_types": ("dv4",)},
+    "A06.09.006": {"name": "Флюорография", "done": "Перезачет", "months_back": 1, "exam_types": _RECREDIT_TYPES},
+    "A05.10.006": {"name": "ЭКГ", "done": "Перезачет", "months_back": 1, "exam_types": _RECREDIT_TYPES},
+    "A06.20.004": {"name": "Маммография", "done": "Перезачет", "months_back": 1, "exam_types": _RECREDIT_TYPES},
 }
+
+
+def _norm_exam_type_token(raw: str) -> str:
+    t = (raw or "").strip().lower().replace("ё", "е")
+    t = t.replace("дв-4", "dv4").replace("дв4", "dv4")
+    t = t.replace("опв", "opv")
+    t = t.replace("уд-1", "ud1").replace("уд 1", "ud1").replace("уд1", "ud1")
+    return t
+
 
 
 @dataclass
@@ -51,7 +63,7 @@ class RecreditRule:
     name: str = ""
     done: str = "Перезачет"
     months_back: int = 1
-    exam_types: tuple[str, ...] = ("dv4",)  # пусто = любой тип
+    exam_types: tuple[str, ...] = ("dv4", "ud1")  # пусто = любой тип
 
 
 @dataclass
@@ -375,7 +387,7 @@ def _read_recredit_from_doctors_sheet(path: Path) -> dict[str, RecreditRule]:
                 name=name,
                 done=done,
                 months_back=1,
-                exam_types=("dv4",),
+                exam_types=_RECREDIT_TYPES,
             )
         return out
     finally:
@@ -425,12 +437,12 @@ def _read_recredit_sheet(path: Path) -> dict[str, RecreditRule]:
                     months = int(float(str(raw[i_months]).replace(",", ".")))
                 except ValueError:
                     months = 1
-            types_raw = str(raw[i_type] or "").strip().lower() if i_type is not None else "dv4"
+            types_raw = str(raw[i_type] or "").strip().lower() if i_type is not None else "dv4,ud1"
             if not types_raw:
-                types = ("dv4",)
+                types = _RECREDIT_TYPES
             else:
                 types = tuple(
-                    t.strip().replace("дв4", "dv4").replace("опв", "opv")
+                    _norm_exam_type_token(t)
                     for t in re.split(r"[,;/|\s]+", types_raw)
                     if t.strip()
                 )
@@ -439,7 +451,7 @@ def _read_recredit_sheet(path: Path) -> dict[str, RecreditRule]:
                 name=str(raw[i_name] or "").strip() if i_name is not None else "",
                 done=(str(raw[i_done] or "").strip() if i_done is not None else "") or "Перезачет",
                 months_back=max(0, months),
-                exam_types=types or ("dv4",),
+                exam_types=types or _RECREDIT_TYPES,
             )
         return out
     finally:
@@ -460,7 +472,7 @@ def resolve_service_done_and_date(
     «Перезачет» и дата = окончание − months_back.
     """
     code = (service_code or "").strip().upper()
-    et = (exam_type or "").strip().lower().replace("дв4", "dv4").replace("опв", "opv")
+    et = _norm_exam_type_token(exam_type)
     rule = (rules or {}).get(code)
     if rule is None:
         return default_done, end_date, None
