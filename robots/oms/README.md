@@ -7,5 +7,7 @@
 | `dv_opv/` | ДВ4 / ОПВ | `run_medical_exam.py` |
 | `socstatus/` | соцстатус в карте пациента | `run_socstatus.py` |
 | `fix_diagnosis/` | правка диагноза ds1 по номеру талона | `run_fix_diagnosis.py` |
+| `fix_service/` | замена кода услуги в ambulatory | `run_fix_service.py` |
+| `fix_service_place/` | замена «Место обслуживания» `#service-place` | `run_fix_service_place.py` |
 
 Общие хелперы ОМС живут в `dv_opv/add_medical_exam.py` — их импортируют `cel_307`, `cel_3` и `fix_diagnosis`.
