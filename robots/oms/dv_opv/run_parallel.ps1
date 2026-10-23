@@ -9,7 +9,8 @@ param(
     [int]$LimitPerWorker = 0,
     [string]$File = "",
     [string]$Catalog = "",
-    [int]$StaggerMs = 4000
+    [int]$StaggerMs = 4000,
+    [switch]$NoRecredit
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,16 +101,19 @@ for ($w = 0; $w -lt $Workers; $w++) {
     $errLog = Join-Path $LogDir "$worker.err.log"
     Remove-Item $outLog, $errLog -Force -ErrorAction SilentlyContinue
 
-    $argLine = @(
+    $argParts = @(
         $Launcher,
         "--file", $Xlsx,
         "--catalog", $Cat,
         "--offset", "$offset",
         "--limit", "$limit"
-    ) | ForEach-Object { Quote-WinArg $_ }
-    $argLine = $argLine -join ' '
+    )
+    if ($NoRecredit) {
+        $argParts += "--no-recredit"
+    }
+    $argLine = ($argParts | ForEach-Object { Quote-WinArg $_ }) -join ' '
 
-    Write-Host "Start $worker offset=$offset limit=$limit"
+    Write-Host "Start $worker offset=$offset limit=$limit noRecredit=$NoRecredit"
 
     $p = Start-Process -FilePath $Py `
         -ArgumentList $argLine `

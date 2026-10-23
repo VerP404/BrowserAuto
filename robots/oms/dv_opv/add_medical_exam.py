@@ -53,6 +53,7 @@ from doctors_catalog import (
     DEFAULT_REFERENCE,
     DoctorCatalog,
     dn_search_texts,
+    is_questionnaire_service,
     load_dn_labels,
     load_recredit_rules,
     resolve_service_doctor,
@@ -159,8 +160,13 @@ def _cell(value: object) -> str:
         return ""
     if isinstance(value, datetime):
         return value.strftime("%d-%m-%y")
+    # Excel serial как число (на всякий случай — даты лучше через normalize_service_date)
     if isinstance(value, float) and value.is_integer():
+        if 20000 <= value <= 80000:
+            return normalize_service_date(value)
         return str(int(value))
+    if isinstance(value, int) and not isinstance(value, bool) and 20000 <= value <= 80000:
+        return normalize_service_date(value)
     text = str(value).strip()
     # Excel часто даёт даты как datetime уже обработали; dd.mm.yyyy → dd-mm-yy
     m = re.match(r"^(\d{1,2})[./](\d{1,2})[./](\d{2,4})$", text)
@@ -169,6 +175,8 @@ def _cell(value: object) -> str:
         if len(y) == 4:
             y = y[-2:]
         return f"{int(d):02d}-{int(mo):02d}-{y}"
+    if re.fullmatch(r"\d{5}(?:\.0+)?", text) and 20000 <= float(text) <= 80000:
+        return normalize_service_date(text)
     return text
 
 
@@ -178,21 +186,63 @@ def normalize_oms_date(value: str) -> str:
 
 
 def normalize_service_date(value: object) -> str:
-    """Дата в ОМС: DD-MM-YY (гг, не гггг — иначе 2026 → 20)."""
+    """Дата в ОМС: DD-MM-YY (гг, не гггг — иначе 2026 → 20).
+
+    Чинит Excel-мусор: datetime, serial 46258 / «46258» (когда оператор
+    сохранил дату как число, а потом как текст).
+    """
+    from datetime import date as date_cls
+    from datetime import timedelta
+
     if value is None:
         return ""
     if isinstance(value, datetime):
         return value.strftime("%d-%m-%y")
+    if isinstance(value, date_cls):
+        return value.strftime("%d-%m-%y")
+
+    def _from_serial(n: float) -> str | None:
+        if not (20000 <= float(n) <= 80000):
+            return None
+        # Excel epoch с учётом бага Lotus 1900
+        dt = datetime(1899, 12, 30) + timedelta(days=int(n))
+        return dt.strftime("%d-%m-%y")
+
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        serial = _from_serial(float(value))
+        if serial:
+            return serial
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value).strip()
+
     text = str(value).strip()
     if not text:
         return ""
-    m = re.match(r"^(\d{1,2})[-./](\d{1,2})[-./](\d{2,4})$", text)
+    if re.fullmatch(r"\d{5}(?:\.0+)?", text):
+        serial = _from_serial(float(text))
+        if serial:
+            return serial
+    # ISO / выгрузка портала: YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD
+    m_iso = re.match(
+        r"^(\d{4})[-./](\d{1,2})[-./](\d{1,2})(?:\s+.*)?$",
+        text,
+    )
+    if m_iso:
+        y, mo, d = m_iso.groups()
+        return f"{int(d):02d}-{int(mo):02d}-{y[-2:]}"
+    m = re.match(r"^(\d{1,2})[-./](\d{1,2})[-./](\d{2,4})(?:\s+.*)?$", text)
     if not m:
-        # уже цифры без разделителей DDMMYY / DDMMYYYY
+        # уже цифры без разделителей DDMMYY / DDMMYYYY / YYYYMMDD
         digits = re.sub(r"\D", "", text)
         if len(digits) == 6:
             return f"{digits[0:2]}-{digits[2:4]}-{digits[4:6]}"
         if len(digits) == 8:
+            # 20xx/19xx → YYYYMMDD, иначе DDMMYYYY
+            if digits[0:2] in ("19", "20"):
+                return f"{digits[6:8]}-{digits[4:6]}-{digits[2:4]}"
             return f"{digits[0:2]}-{digits[2:4]}-{digits[6:8]}"
         return text
     d, mo, y = m.groups()
@@ -560,6 +610,28 @@ def _is_intersection_warning(text: str) -> bool:
     return "пересечен" in low  # пересечение / пересечения / пересечением
 
 
+def _has_save_with_warning_label(*parts: str) -> bool:
+    """Есть ли текст/кнопка «Сохранить с предупреждением(ями)» (ед. и мн.)."""
+    blob = " ".join((p or "").lower().replace("ё", "е").replace("\n", " ") for p in parts)
+    return "с предупрежден" in blob  # …ем / …ями
+
+
+def _mentions_save_with_warning(*parts: str) -> bool:
+    """Мягкое предупреждение с кнопкой «Сохранить с предупреждением(ями)».
+
+    Дубликат без кнопки подтверждения — не сюда. Если кнопка есть — True
+    (в т.ч. при тексте «пересечение»: OMS сам предлагает сохранить).
+    """
+    blob = " ".join((p or "").lower().replace("ё", "е").replace("\n", " ") for p in parts)
+    if _has_save_with_warning_label(blob):
+        return True
+    if "дубликат" in blob or "пересечен" in blob:
+        return False
+    if "имеются предупрежд" in blob or "несоответств" in blob:
+        return True
+    return False
+
+
 def _is_blocking_dialog(text: str) -> bool:
     """Жёсткий отказ: дубликат, пересечение, недопустимое ДН — не жать подтверждение."""
     low = (text or "").lower().replace("ё", "е")
@@ -646,13 +718,13 @@ def dismiss_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
             buttons.append((_btn_label(driver, btn), btn))
 
     btn_blob = " | ".join((l or "").lower().replace("\n", " ") for l, _ in buttons)
-    if (
-        "сохранить с предупреждением" in btn_blob
-        or "с предупреждением" in btn_blob
-        or "имеются предупрежд" in low_text
-    ):
+    # Жёсткий дубликат без кнопки подтверждения — гасим. Иначе, если OMS дал
+    # «Сохранить с предупреждениями» (в т.ч. пересечение цели 3) — не жмём ВЕРНУТЬСЯ.
+    if "дубликат" in low_text and not _has_save_with_warning_label(btn_blob):
+        pass  # ниже кликнем НАЗАД/ВЕРНУТЬСЯ
+    elif _has_save_with_warning_label(btn_blob, low_text):
         logger.info(
-            "dismiss пропущен — диалог предупреждений (нужно «Сохранить с предупреждением»)"
+            "dismiss пропущен — диалог предупреждений (нужно «Сохранить с предупреждениями»)"
         )
         return False, text or "нужно подтвердить предупреждение"
 
@@ -719,20 +791,10 @@ def confirm_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
         return False, ""
     if not text:
         text = "(диалог без текста)"
-    if _is_blocking_dialog(text):
-        # пересечение / дубликат — только отмена, без сохранения
-        logger.error("Блокирующее предупреждение (отмена Save): {}", text[:400])
-        dismissed, _ = dismiss_warning_dialog(driver)
-        if not dismissed:
-            logger.warning("Не удалось закрыть блокирующий диалог")
-        return False, text
-
-    logger.info("Предупреждение после сохранения:\n{}", text[:800])
-
+    # кнопки сначала — чтобы «пересечение» с кнопкой «Сохранить с предупреждениями» не гасить
     buttons: list[tuple[str, object]] = []
-    # широкий поиск кнопок модалки (MUI portal)
     xpaths = (
-        "//button[contains(.,'Сохранить с предупреждением') or contains(.,'сохранить с предупреждением')]",
+        "//button[contains(.,'Сохранить с предупрежден') or contains(.,'сохранить с предупрежден')]",
         "//button[contains(.,'ДЛЯ ТАЛОНА И ПАЦИЕНТА') or contains(.,'Для талона и пациента')]",
         "//button[contains(.,'ДЛЯ ТАЛОНА')]",
         "//button[contains(.,'Да') or contains(.,'ДА')]",
@@ -760,6 +822,16 @@ def confirm_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
                 continue
             buttons.append((_btn_label(driver, btn), btn))
 
+    button_blob_early = " | ".join(
+        (l or "").lower().replace("\n", " ") for l, _ in buttons
+    )
+    if _is_blocking_dialog(text) and not _has_save_with_warning_label(button_blob_early):
+        logger.error("Блокирующее предупреждение (отмена Save): {}", text[:400])
+        dismissed, _ = dismiss_warning_dialog(driver)
+        if not dismissed:
+            logger.warning("Не удалось закрыть блокирующий диалог")
+        return False, text
+
     if not buttons:
         # dump для отладки
         try:
@@ -780,21 +852,21 @@ def confirm_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
 
     labels = [l or "(пусто)" for l, _ in buttons]
     logger.info("Кнопки диалога ({}): {}", len(buttons), labels[:12])
+    logger.info("Предупреждение после сохранения:\n{}", text[:800])
 
     low_text = text.lower().replace("ё", "е")
     deny = ("назад", "отмена", "отменить", "нет", "закрыть", "cancel", "close", "не сохр", "вернуться")
 
-    button_blob = " | ".join(l.lower().replace("\n", " ") for l, _ in buttons)
-    # ВАЖНО: если есть «Сохранить с предупреждением» — всегда её (даже если текст ещё про пациента)
+    button_blob = button_blob_early
+    # ВАЖНО: если есть «Сохранить с предупреждением(ями)» — всегда её
     if (
-        "сохранить с предупреждением" in button_blob
-        or "с предупреждением" in button_blob
+        _has_save_with_warning_label(button_blob)
         or "имеются предупрежд" in low_text
         or "несоответств" in low_text
     ):
         prefer = (
-            "сохранить с предупреждением",
-            "с предупреждением",
+            "сохранить с предупрежден",
+            "с предупрежден",
             "сохранить с",
             "да",
             "ok",
@@ -809,8 +881,8 @@ def confirm_warning_dialog(driver: WebDriver) -> tuple[bool, str]:
         )
     else:
         prefer = (
-            "сохранить с предупреждением",
-            "с предупреждением",
+            "сохранить с предупрежден",
+            "с предупрежден",
             "для талона и пациента",
             "да",
             "ok",
@@ -928,7 +1000,7 @@ def handle_post_save_prompts(driver: WebDriver, *, timeout: float = 40) -> tuple
             "имеются предупрежд" in low0
             or "несоответств" in low0
             or "специальност" in low0
-            or "сохранить с предупреждением" in btn_blob0
+            or _has_save_with_warning_label(btn_blob0)
         )
         blob = _dn_error_blob(text)
         if (
@@ -961,8 +1033,8 @@ def handle_post_save_prompts(driver: WebDriver, *, timeout: float = 40) -> tuple
                     )
                 except Exception:
                     bb0 = ""
-                if "сохранить с предупреждением" in bb0 or "с предупреждением" in bb0:
-                    logger.info("Есть «Сохранить с предупреждением» — подтверждаем, не НАЗАД")
+                if _has_save_with_warning_label(bb0):
+                    logger.info("Есть «Сохранить с предупреждениями» — подтверждаем, не НАЗАД")
                 else:
                     logger.error("Блокирующий диалог после Save — отмена (НАЗАД): {}", text[:400])
                     dismiss_warning_dialog(driver)
@@ -979,7 +1051,7 @@ def handle_post_save_prompts(driver: WebDriver, *, timeout: float = 40) -> tuple
             clicked = ""
             if "→ [" in low_w:
                 clicked = low_w.rsplit("→ [", 1)[-1].rstrip("]").strip()
-            if "сохранить с предупреждением" in clicked or "с предупреждением" in clicked:
+            if _has_save_with_warning_label(clicked):
                 saved_with_warning = True
                 patient_choice_done = True
             # После «ДЛЯ ТАЛОНА» (не «и пациента») ждём следующее окно и жмём
@@ -1003,12 +1075,11 @@ def handle_post_save_prompts(driver: WebDriver, *, timeout: float = 40) -> tuple
                         bb = ""
                     t_w = (warning_dialog_text(driver) or "").lower().replace("ё", "е")
                     if (
-                        "сохранить с предупреждением" in bb
-                        or "с предупреждением" in bb
+                        _has_save_with_warning_label(bb)
                         or "имеются предупрежд" in t_w
                         or "несоответств" in t_w
                     ):
-                        logger.info("Появилось окно предупреждений — жмём «Сохранить с предупреждением»")
+                        logger.info("Появилось окно предупреждений — жмём «Сохранить с предупреждениями»")
                         break
                     if not find_visible_dialogs(driver) and not (warning_dialog_text(driver) or "").strip():
                         logger.info("После «ДЛЯ ТАЛОНА» диалогов нет")
@@ -1036,7 +1107,7 @@ def handle_post_save_prompts(driver: WebDriver, *, timeout: float = 40) -> tuple
                     )
                 except Exception:
                     bb2 = ""
-                if "сохранить с предупреждением" in bb2 or "с предупреждением" in bb2:
+                if _has_save_with_warning_label(bb2):
                     ok2, w2 = confirm_warning_dialog(driver)
                     if ok2:
                         saved_with_warning = True
@@ -1898,12 +1969,15 @@ def _is_invalid_dn_error(msg: str) -> bool:
         return True
     if "значен" in low and "диспансерн" in low:
         return True
+    # «Ошибка создания талона» + ДН / диагноз (часто I67.8 с ДН=3 при уже состоящем)
+    if "ошибка создания" in low and ("диспансерн" in low or "наблюден" in low):
+        return True
     if "диспансерн" in low and "диагноз" in low and any(
         x in low for x in ("недопустим", "неверн", "ошибк", "не соответ", "правим дн")
     ):
         return True
     # диалог пациента завис / НАЗАД — тоже чиним ДН на «Состоит»
-    if "правим дн на форме" in low or "диалог пациента" in low and "назад" in low:
+    if "правим дн на форме" in low or ("диалог пациента" in low and "назад" in low):
         return True
     return False
 
@@ -1920,6 +1994,24 @@ def _needs_dn_consists_fix(msg: str) -> bool:
     return False
 
 
+def _enrich_save_error_msg(driver: WebDriver, msg: str) -> str:
+    """Подтянуть claim-error / snackbar, если Save вернул пустой или обрезанный текст."""
+    bits = [(msg or "").strip()]
+    try:
+        panel = read_claim_error_panel(driver, click=True)
+        if panel and panel not in bits[0]:
+            bits.append(panel)
+    except Exception:
+        pass
+    try:
+        snack = snackbar_text(driver)
+        if snack and snack not in " | ".join(bits):
+            bits.append(snack)
+    except Exception:
+        pass
+    return " | ".join(b for b in bits if b)[:800]
+
+
 def apply_dn_code(
     driver: WebDriver,
     row: TalonRow,
@@ -1928,13 +2020,17 @@ def apply_dn_code(
     *,
     why: str = "",
 ) -> None:
-    """Выставить ДН=dn_code на основной (+ сопутствующие с тем же кодом, если были 1/3/пусто)."""
+    """Выставить ДН=dn_code на основной и все сопутствующие с диагнозом.
+
+    Типичный кейс ОМС: «Недопустимое значение ДН при диагнозе I67.8» —
+    в файле стояло «Не подлежит»(3), а пациент уже состоит → ставим «Состоит»(1).
+    """
     code = normalize_dn(dn_code) or str(dn_code).strip()
     row.dn = code
     new_extras: list[tuple[str, str]] = []
     for dx, dn in row.extra_diagnoses:
-        prev = normalize_dn(dn) or (dn or "").strip()
-        if dx and prev in ("", "1", "3", "7"):
+        # при fix после ошибки ДН — всегда переписываем сопутствующие, не только 1/3/7
+        if dx:
             new_extras.append((dx, code))
         else:
             new_extras.append((dx, dn))
@@ -1952,12 +2048,22 @@ def apply_dn_code(
     logger.warning("Ставим ДН={} ({}) на диагнозы", code, why or "fix")
     if not fill_dn_field(driver, 0, code, dn_map):
         logger.warning("ДН[0]={} не заполнен", code)
+    # все строки с диагнозом из Excel
     for i, (dx, dn) in enumerate(row.extra_diagnoses, start=1):
         if not dx or not driver.find_elements(By.ID, f"is-dispensary-observation-{i}"):
             continue
-        if (normalize_dn(dn) or dn) == code:
-            if not fill_dn_field(driver, i, code, dn_map):
-                logger.warning("ДН[{}]={} не заполнен", i, code)
+        if not fill_dn_field(driver, i, code, dn_map):
+            logger.warning("ДН[{}]={} не заполнен", i, code)
+    # плюс любые видимые поля ДН на форме (если ОМС добавил строку сам)
+    for i in range(1, 12):
+        if not driver.find_elements(By.ID, f"is-dispensary-observation-{i}"):
+            break
+        if not driver.find_elements(By.ID, f"diagnosis-{i}"):
+            continue
+        # уже заполнили из Excel — повтор ок
+        if i <= len(row.extra_diagnoses):
+            continue
+        fill_dn_field(driver, i, code, dn_map)
 
 
 def dn_for_exam_type(exam_type: str, dn: str) -> str:
@@ -2288,14 +2394,14 @@ _SERVICE_CODE_RE = re.compile(
 )
 
 
-def service_code_label(driver: WebDriver, index: int) -> str:
-    """Код услуги из колонки «Наименование» (первый combobox-doctor-N в ОМС)."""
+def service_code_and_label(driver: WebDriver, index: int) -> tuple[str, str]:
+    """Код и подпись услуги из колонки «Наименование» (первый combobox-doctor-N)."""
     els = driver.find_elements(By.ID, f"combobox-doctor-{index}")
     if not els:
-        return ""
+        return "", ""
     wrap = _closest_react_select(els[0])
     if not wrap:
-        return ""
+        return "", ""
     chunks: list[str] = []
     for sel in wrap.find_elements(By.CSS_SELECTOR, ".Selected-item, .Select-value, .Select-value-label"):
         text = (sel.text or sel.get_attribute("title") or "").strip()
@@ -2303,12 +2409,17 @@ def service_code_label(driver: WebDriver, index: int) -> str:
             chunks.append(text)
     blob = " ".join(chunks)
     if not blob:
-        return ""
+        return "", ""
     # UI иногда дублирует значение («B01.001.001B01.001.001») — берём первое вхождение
     m = _SERVICE_CODE_RE.search(blob.replace(" ", ""))
-    if m:
-        return m.group(0)
-    return re.sub(r"\s+", "", blob)
+    code = m.group(0) if m else re.sub(r"\s+", "", blob)
+    return code, blob
+
+
+def service_code_label(driver: WebDriver, index: int) -> str:
+    """Код услуги из колонки «Наименование» (первый combobox-doctor-N в ОМС)."""
+    code, _ = service_code_and_label(driver, index)
+    return code
 
 
 def _closest_react_select(input_el):
@@ -2488,28 +2599,70 @@ def fill_services(
         logger.warning("Строк услуг не найдено")
         return 0
 
-    date_for_services = row.end or row.begin
+    begin = row.begin or row.end
+    end = row.end or row.begin
     done_default = normalize_service_done(row.done_value)
     rules = recredit_rules if recredit_rules is not None else load_recredit_rules()
-    filled = 0
+
+    # План дат: перезачёты → сдвиг; анкетирование → begin; остальные не-перезачёты → end.
+    # ОМС: при begin≠end нужна хотя бы одна не-перезачётная услуга на begin и на end.
+    plans: list[dict] = []
     for i in indices:
+        code, label = service_code_and_label(driver, i)
+        doctor = resolve_service_doctor(
+            catalog,
+            building=row.building,
+            service_code=code,
+            main_doctor=row.doctor,
+        )
+        done_val, svc_date, rr = resolve_service_done_and_date(
+            rules,
+            exam_type=row.exam_type,
+            service_code=code,
+            end_date=end,
+            begin_date=begin,
+            label=label,
+            default_done=done_default,
+        )
+        plans.append(
+            {
+                "i": i,
+                "code": code,
+                "label": label,
+                "doctor": doctor,
+                "done_val": done_val,
+                "svc_date": svc_date,
+                "rr": rr,
+            }
+        )
+
+    if begin and end and begin != end:
+        non_rec = [p for p in plans if p["rr"] is None]
+        has_begin = any(p["svc_date"] == begin for p in non_rec)
+        if not has_begin and non_rec:
+            anchor = next(
+                (p for p in non_rec if is_questionnaire_service(p["code"], p["label"])),
+                non_rec[0],
+            )
+            anchor["svc_date"] = begin
+            logger.info(
+                "Услуга[{}] якорь даты начала ДВН → {} (code={})",
+                anchor["i"],
+                begin,
+                anchor["code"] or "—",
+            )
+
+    filled = 0
+    for plan in plans:
+        i = plan["i"]
         last_exc: Exception | None = None
         for attempt in range(1, 4):
             try:
-                code = service_code_label(driver, i)
-                doctor = resolve_service_doctor(
-                    catalog,
-                    building=row.building,
-                    service_code=code,
-                    main_doctor=row.doctor,
-                )
-                done_val, svc_date, rr = resolve_service_done_and_date(
-                    rules,
-                    exam_type=row.exam_type,
-                    service_code=code,
-                    end_date=date_for_services,
-                    default_done=done_default,
-                )
+                code = plan["code"]
+                doctor = plan["doctor"]
+                done_val = plan["done_val"]
+                svc_date = plan["svc_date"]
+                rr = plan["rr"]
                 if attempt == 1:
                     src = "справочник" if doctor and doctor != (row.doctor or "").strip() else (
                         "карта" if doctor else "пусто"
@@ -2517,6 +2670,8 @@ def fill_services(
                     extra = ""
                     if rr is not None:
                         extra = f" | перезачет={done_val!r} дата={svc_date} (−{rr.months_back}м, {rr.name or code})"
+                    elif begin and svc_date == begin and begin != end:
+                        extra = f" | дата начала ДВН={svc_date}"
                     logger.info(
                         "Услуга[{}] code={} doctor={} [{}] корпус={}{}",
                         i,
@@ -2538,6 +2693,32 @@ def fill_services(
                 logger.warning("Услуга[{}] stale/missing, retry {}/3", i, attempt)
                 sleep(0.4)
                 wait_busy_gone(driver, timeout=15)
+                # после stale — перечитать код (DOM мог обновиться)
+                code, label = service_code_and_label(driver, i)
+                plan["code"] = code
+                plan["label"] = label
+                plan["doctor"] = resolve_service_doctor(
+                    catalog,
+                    building=row.building,
+                    service_code=code,
+                    main_doctor=row.doctor,
+                )
+                done_val, svc_date, rr = resolve_service_done_and_date(
+                    rules,
+                    exam_type=row.exam_type,
+                    service_code=code,
+                    end_date=end,
+                    begin_date=begin,
+                    label=label,
+                    default_done=done_default,
+                )
+                if begin and end and begin != end and rr is None:
+                    # сохранить якорь begin, если эта строка была якорем
+                    if plan.get("svc_date") == begin or is_questionnaire_service(code, label):
+                        svc_date = begin
+                plan["done_val"] = done_val
+                plan["svc_date"] = svc_date
+                plan["rr"] = rr
         if last_exc is not None:
             raise last_exc
     return filled
@@ -2601,29 +2782,39 @@ def process_row(
             n_svc = fill_services(driver, row, catalog, recredit_rules=recredit_rules)
             fill_purposes(driver, row)
             ok, msg = save_claim(driver, begin=row.begin, end=row.end)
-        # Недопустимое ДН / зависший диалог пациента → НАЗАД уже нажали → «Состоит» → Save
-        if (not ok) and _needs_dn_consists_fix(msg):
+        # Недопустимое ДН (часто I67.8 + «Не подлежит») / зависший диалог → «Состоит» → Save
+        # до 2 попыток: после первого Save ошибка может прийти уже в claim-error / пустом диалоге
+        for dn_try in range(1, 3):
+            if ok:
+                break
+            msg = _enrich_save_error_msg(driver, msg)
+            if not _needs_dn_consists_fix(msg):
+                break
             et = (row.exam_type or "").lower()
             want = "7" if et == "opv" else "1"
-            # если уже Состоит и снова та же ошибка — для ДВ4 всё равно ещё раз выставим подпись
             logger.warning(
-                "[{}] ДН/диалог пациента — ставим {} ({}) на форме и Save снова ({})",
+                "[{}] ДН/диалог пациента — ставим {} ({}) на форме и Save снова try={}/2 ({})",
                 index,
                 want,
                 "Состоит, проведено" if want == "7" else "Состоит",
+                dn_try,
                 (msg or "")[:200],
             )
-            # закрыть хвосты диалога, если остались
             try:
                 if find_visible_dialogs(driver) or warning_dialog_text(driver):
                     dismiss_warning_dialog(driver)
             except Exception:
                 pass
-            apply_dn_code(driver, row, want, dn_labels, why="retry после НАЗАД/ошибки ДН")
+            apply_dn_code(
+                driver,
+                row,
+                want,
+                dn_labels,
+                why=f"retry после НАЗАД/ошибки ДН try={dn_try}",
+            )
             if _is_social_status_error(msg):
                 ensure_patient_social_status(driver, row)
                 ensure_claim_dates_present(driver, row.begin, row.end, why="ДН+соц retry")
-            # услуги не перезаполняем — только Save с услуг
             if driver.find_elements(By.ID, "services-tab"):
                 try:
                     click_id(driver, "services-tab")
@@ -2632,6 +2823,8 @@ def process_row(
                 except Exception:
                     pass
             ok, msg = save_claim(driver, begin=row.begin, end=row.end)
+            if not ok:
+                msg = _enrich_save_error_msg(driver, msg)
         # ОПВ: «состоит по диагнозу» / неверный код ДН → ставим 7 и Save ещё раз
         if (
             (not ok)
@@ -2728,6 +2921,11 @@ def parse_args() -> argparse.Namespace:
         help="Справочник ДВ4/ОПВ/УД1 (листы «ДН» и «справочник_врачей»)",
     )
     p.add_argument("--dry-run", action="store_true", help="Заполнить форму без Save")
+    p.add_argument(
+        "--no-recredit",
+        action="store_true",
+        help="Полностью отключить перезачёт услуг (игнор колонки/листа и builtin)",
+    )
     p.add_argument("--keep-open", type=int, default=0)
     p.add_argument("--make-template", action="store_true")
     return p.parse_args()
@@ -2761,19 +2959,23 @@ def main() -> int:
     dn_labels = load_dn_labels(args.catalog)
     if not dn_labels:
         dn_labels = load_dn_labels(DEFAULT_REFERENCE)
-    recredit_rules = load_recredit_rules(args.catalog)
+    if args.no_recredit:
+        recredit_rules = {}
+    else:
+        recredit_rules = load_recredit_rules(args.catalog)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     result_path = RESULTS_DIR / f"dv_opv_result_{stamp}_o{args.offset}.csv"
 
     catalog_src = Path(catalog.source).name if catalog.source else str(args.catalog)
     logger.info(
-        "Строк: {} | dry_run={} | врачи: {} правил ({}) | ДН: {} | перезачет: {} кодов",
+        "Строк: {} | dry_run={} | врачи: {} правил ({}) | ДН: {} | перезачет: {} кодов{}",
         len(rows),
         args.dry_run,
         len(catalog.rules),
         catalog_src,
         len(dn_labels),
         len(recredit_rules),
+        " (ОТКЛЮЧЁН)" if args.no_recredit else "",
     )
     results: list[RowResult] = []
     t_all = time()

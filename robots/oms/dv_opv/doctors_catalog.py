@@ -47,6 +47,17 @@ BUILTIN_RECREDIT_CODES: dict[str, dict[str, object]] = {
     "A06.20.004": {"name": "Маммография", "done": "Перезачет", "months_back": 1, "exam_types": _RECREDIT_TYPES},
 }
 
+# Анкетирование: при многодневной ДВН дата услуги = дата начала (требование ОМС).
+QUESTIONNAIRE_SERVICE_PREFIXES = ("A01.30.026",)
+
+
+def is_questionnaire_service(service_code: str, label: str = "") -> bool:
+    """True для анкетирования (код A01.30.026* или «анкет» в подписи)."""
+    code = (service_code or "").strip().upper()
+    if any(code == p or code.startswith(p) for p in QUESTIONNAIRE_SERVICE_PREFIXES):
+        return True
+    return "анкет" in (label or "").lower()
+
 
 def _norm_exam_type_token(raw: str) -> str:
     t = (raw or "").strip().lower().replace("ё", "е")
@@ -464,23 +475,29 @@ def resolve_service_done_and_date(
     exam_type: str,
     service_code: str,
     end_date: str,
+    begin_date: str = "",
+    label: str = "",
     default_done: str = "Да",
 ) -> tuple[str, str, RecreditRule | None]:
     """
     Для услуги: (выполнено, дата, правило|None).
     Если код в справочнике перезачёта и тип талона подходит —
     «Перезачет» и дата = окончание − months_back.
+    Иначе: обычные услуги → дата окончания; анкетирование → дата начала
+    (ОМС: при begin≠end хотя бы одна не-перезачётная услуга на begin и на end).
     """
     code = (service_code or "").strip().upper()
     et = _norm_exam_type_token(exam_type)
     rule = (rules or {}).get(code)
-    if rule is None:
-        return default_done, end_date, None
-    allowed = tuple(t.lower() for t in (rule.exam_types or ()))
-    if allowed and et not in allowed and "*" not in allowed:
-        return default_done, end_date, None
-    shifted = shift_date_months(end_date, -int(rule.months_back or 0)) or end_date
-    return (rule.done or "Перезачет"), shifted, rule
+    if rule is not None:
+        allowed = tuple(t.lower() for t in (rule.exam_types or ()))
+        if not allowed or et in allowed or "*" in allowed:
+            shifted = shift_date_months(end_date, -int(rule.months_back or 0)) or end_date
+            return (rule.done or "Перезачет"), shifted, rule
+    # не перезачёт
+    if is_questionnaire_service(code, label):
+        return default_done, (begin_date or end_date), None
+    return default_done, end_date, None
 
 
 def shift_date_months(value: str, months: int) -> str:
